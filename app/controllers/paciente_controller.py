@@ -15,7 +15,7 @@ from app.services import (
     service_anticoncepcion,
 )
 
-bp = Blueprint("pacientes", __name__, url_prefix="/pacientes")
+bp = Blueprint("pacientes", __name__, url_prefix="/paciente")
 
 def _ok(data, code=200):   return {"ok": True,  "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
@@ -26,7 +26,7 @@ def _usuario_actual_from_request():
     return {"usuario_id": user_id} if user_id else None
 
 
-@bp.post("/paciente")
+@bp.post("/create")
 def crear_paciente():
     """
     Orquesta la creación de: paciente + todas las secciones HCP.
