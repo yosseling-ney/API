@@ -1,36 +1,29 @@
-
 from flask import Blueprint, request, jsonify
-from app.db import start_session_if_possible  # tu helper de sesiones/tx
-from app.services import (
-    service_paciente,
-    service_identificacion,
-    service_antencedentes,
-    service_gestacion_actual,
-    service_parto_aborto,
-    service_patologias,
-    service_recien_nacido,
-    service_puerperio,
-    service_egreso_neonatal,
-    service_egreso_materno,
-    service_anticoncepcion,
-)
+from bson import ObjectId
+from app import mongo
+from app.db import start_session_if_possible
+from app.utils.jwt_manager import verificar_token
+from app.services import service_paciente, service_historial
 
-bp = Blueprint("pacientes", __name__, url_prefix="/paciente")
+bp = Blueprint("pacientes", __name__, url_prefix="/pacientes")
 
 def _ok(data, code=200):   return {"ok": True,  "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
 def _usuario_actual_from_request():
-    # Ajusta según tu autenticación (JWT / headers). Ejemplo simple:
-    user_id = request.headers.get("X-User-Id")
-    return {"usuario_id": user_id} if user_id else None
+    auth_header = request.headers.get("Authorization", "") or ""
+    token = auth_header.split(" ")[-1].strip() if auth_header else ""
+    if not token:
+        return None
+    datos = verificar_token(token)
+    return datos if datos and datos.get("usuario_id") else None
 
 
 @bp.post("/create")
 def crear_paciente():
     """
-    Orquesta la creación de: paciente + todas las secciones HCP.
-    Si algún paso falla, revierte (si hay transacción disponible).
+    Orquesta la creacion de: paciente + primer historial.
+    Si falla historial, revierte y borra el paciente creado.
     """
     usuario_actual = _usuario_actual_from_request()
     if not usuario_actual:
@@ -38,161 +31,126 @@ def crear_paciente():
         return jsonify(res), code
 
     body = request.get_json() or {}
-    # Bloques mínimos esperados en el payload:
-    required_blocks = [
-        "datos_generales",
-        "identificacion",
-        "antecedentes",
-        "gestacion_actual",
-        "parto_aborto",
-        "patologias",
-        "recien_nacido",
-        "puerperio",
-        "egreso_neonatal",
-        "egreso_materno",
-        "anticoncepcion",
-    ]
+
+    required_blocks = ["datos_generales"]
     faltan = [k for k in required_blocks if k not in body]
     if faltan:
         res, code = _fail(f"Faltan bloques: {', '.join(faltan)}", 422)
         return jsonify(res), code
 
-    with start_session_if_possible() as s:
+    datos_generales = body["datos_generales"]
+    hist_data = body.get("historial")
+
+    resumen = {"paciente_id": None, "historial_id": None}
+    paciente_id = None
+    historial_id = None
+    session_used = False
+
+    def _resolve_numero_gesta(current_payload, paciente_id_str, session=None):
+        supplied = current_payload.get("numero_gesta")
+        if supplied not in (None, "", 0):
+            return supplied
         try:
-            # 1) Paciente base
-            pac_res, pac_code = service_paciente.crear_paciente(body["datos_generales"], session=s)
-            if pac_code not in (200, 201) or not pac_res.get("ok"):
-                if s: s.abort_transaction()
-                return jsonify(pac_res), pac_code
-            paciente_id = pac_res["data"]["id"]
+            oid = ObjectId(paciente_id_str)
+        except Exception:
+            return 1
+        query = {"paciente_id": oid}
+        if session:
+            doc = mongo.db.historiales.find_one(query, sort=[("numero_gesta", -1)], session=session)
+        else:
+            doc = mongo.db.historiales.find_one(query, sort=[("numero_gesta", -1)])
+        if not doc:
+            return 1
+        ultimo = doc.get("numero_gesta") or 0
+        try:
+            ultimo = int(ultimo)
+        except Exception:
+            ultimo = 0
+        return ultimo + 1
 
-            # 2) Identificación (inyectamos paciente_id)
-            ident_payload = dict(body["identificacion"])
-            ident_payload["paciente_id"] = paciente_id
-            ident_res, ident_code = service_identificacion.crear_identificacion(
-                usuario_actual, ident_payload, session=s
-            )
-            if ident_code not in (200, 201) or not ident_res.get("ok"):
-                raise RuntimeError(ident_res.get("error") or "Error creando identificación")
+    try:
+        with start_session_if_possible() as s:
+            session_used = bool(s)
+            try:
+                if s:
+                    s.start_transaction()
 
-            # 3) Antecedentes
-            ant_res, ant_code = service_antencedentes.crear_antecedentes(
-                paciente_id, body["antecedentes"], session=s
-            )
-            if ant_code not in (200, 201) or not ant_res.get("ok"):
-                raise RuntimeError(ant_res.get("error") or "Error creando antecedentes")
+                pac_res, pac_code = service_paciente.crear_paciente(datos_generales, session=s)
+                if pac_code not in (200, 201) or not pac_res.get("ok"):
+                    if s:
+                        s.abort_transaction()
+                    return jsonify(pac_res), pac_code
 
-            # 4) Gestación actual
-            gest_res, gest_code = service_gestacion_actual.crear_gestacion_actual(
-                paciente_id, body["gestacion_actual"], session=s
-            )
-            if gest_code not in (200, 201) or not gest_res.get("ok"):
-                raise RuntimeError(gest_res.get("error") or "Error creando gestación actual")
+                paciente_id = pac_res["data"]["id"]
+                resumen["paciente_id"] = paciente_id
 
-            # 5) Parto/Aborto
-            pa_res, pa_code = service_parto_aborto.crear_parto_aborto(
-                paciente_id, body["parto_aborto"], session=s
-            )
-            if pa_code not in (200, 201) or not pa_res.get("ok"):
-                raise RuntimeError(pa_res.get("error") or "Error creando parto/aborto")
+                if hist_data is not None:
+                    hist_payload = dict(hist_data or {})
+                    hist_payload["paciente_id"] = paciente_id
+                    hist_payload["numero_gesta"] = _resolve_numero_gesta(hist_payload, paciente_id, session=s)
 
-            # 6) Patologías
-            pat_res, pat_code = service_patologias.crear_patologias(
-                paciente_id, body["patologias"], session=s
-            )
-            if pat_code not in (200, 201) or not pat_res.get("ok"):
-                raise RuntimeError(pat_res.get("error") or "Error creando patologías")
+                    his_res, his_code = service_historial.crear_historial(hist_payload, session=s)
+                    if his_code not in (200, 201) or not his_res.get("ok"):
+                        raise RuntimeError(his_res.get("error") or "Error creando historial")
 
-            # 7) Recién nacido
-            rn_res, rn_code = service_recien_nacido.crear_recien_nacido(
-                paciente_id, body["recien_nacido"], session=s
-            )
-            if rn_code not in (200, 201) or not rn_res.get("ok"):
-                raise RuntimeError(rn_res.get("error") or "Error creando recien_nacido")
+                    historial_id = his_res["data"]["id"]
+                    resumen["historial_id"] = historial_id
 
-            # 8) Puerperio
-            puer_res, puer_code = service_puerperio.crear_puerperio(
-                paciente_id, body["puerperio"], session=s
-            )
-            if puer_code not in (200, 201) or not puer_res.get("ok"):
-                raise RuntimeError(puer_res.get("error") or "Error creando puerperio")
+                    upd_res, upd_code = service_paciente.actualizar_paciente_por_id(
+                        paciente_id,
+                        {"historial_id": historial_id},
+                        session=s,
+                    )
+                    if upd_code not in (200, 201) or not upd_res.get("ok"):
+                        raise RuntimeError(upd_res.get("error") or "Error vinculando historial al paciente")
 
-            # 9) Egreso neonatal (Egreso del Recién Nacido/a )
-            eneon_res, eneon_code = service_egreso_neonatal.crear_egreso_neonatal(
-                paciente_id, body["egreso_neonatal"], session=s
-            )
-            if eneon_code not in (200, 201) or not eneon_res.get("ok"):
-                raise RuntimeError(eneon_res.get("error") or "Error creando egreso_neonatal")
+                if s:
+                    s.commit_transaction()
+            except Exception:
+                if s:
+                    s.abort_transaction()
+                raise
+    except Exception as e:
+        if paciente_id and not session_used:
+            try:
+                if historial_id:
+                    service_historial.eliminar_historial_por_id(historial_id, hard=True)
+            except Exception:
+                pass
+            try:
+                service_paciente.eliminar_paciente_por_id(paciente_id, hard=True)
+            except Exception:
+                pass
+        res, code = _fail(f"Transaccion revertida: {str(e)}", 500)
+        return jsonify(res), code
 
-            # 10) Egreso materno
-            emat_res, emat_code = service_egreso_materno.crear_egreso_materno(
-                paciente_id, body["egreso_materno"], session=s
-            )
-            if emat_code not in (200, 201) or not emat_res.get("ok"):
-                raise RuntimeError(emat_res.get("error") or "Error creando egreso_materno")
-
-            # 11) Anticoncepción
-            anti_res, anti_code = service_anticoncepcion.crear_anticoncepcion(
-                paciente_id, body["anticoncepcion"], session=s
-            )
-            if anti_code not in (200, 201) or not anti_res.get("ok"):
-                raise RuntimeError(anti_res.get("error") or "Error creando anticoncepción")
-
-            if s: s.commit_transaction()
-
-            res, code = _ok({
-                "paciente_id": paciente_id,
-                "identificacion_id": ident_res["data"].get("id"),
-                "antecedentes_id": ant_res["data"].get("id"),
-                "gestacion_actual_id": gest_res["data"].get("id"),
-                "parto_aborto_id": pa_res["data"].get("id"),
-                "patologias_id": pat_res["data"].get("id"),
-                "recien_nacido_id": rn_res["data"].get("id"),
-                "puerperio_id": puer_res["data"].get("id"),
-                "egreso_neonatal_id": eneon_res["data"].get("id"),
-                "egreso_materno_id": emat_res["data"].get("id"),
-                "anticoncepcion_id": anti_res["data"].get("id"),
-            }, 201)
-            return jsonify(res), code
-
-        except Exception as e:
-            if s: s.abort_transaction()
-            res, code = _fail(f"Transacción revertida: {str(e)}", 500)
-            return jsonify(res), code
-
+    res, code = _ok(resumen, 201)
+    return jsonify(res), code
 
 @bp.get("/<paciente_id>")
 def obtener_paciente(paciente_id):
     """
-    Devuelve el agregado del paciente + todas las secciones HCP,
-    usando exclusivamente SERVICES.
+    Devuelve el paciente + su historial más reciente (si existe).
     """
-    pac = service_paciente.obtener_paciente(paciente_id)
-    if not pac.get("ok"):
-        return jsonify(pac), 404
+    pac_res, pac_code = service_paciente.obtener_paciente(paciente_id)
+    if pac_code not in (200, 201) or not pac_res.get("ok"):
+        return jsonify(pac_res), pac_code
 
-    ident, _ = service_identificacion.obtener_identificacion_por_paciente(paciente_id)
-    ant, _   = service_antencedentes.get_antecedentes_by_id_paciente(paciente_id)
-    gest, _  = service_gestacion_actual.get_gestacion_actual_by_id_paciente(paciente_id)
-    pa, _    = service_parto_aborto.get_parto_aborto_by_id_paciente(paciente_id)
-    pat, _   = service_patologias.get_patologias_by_id_paciente(paciente_id)
-    rn, _    = service_recien_nacido.get_recien_nacido_by_id_paciente(paciente_id)
-    puer, _  = service_puerperio.get_puerperio_by_id_paciente(paciente_id)
-    eneon,_  = service_egreso_neonatal.get_egreso_neonatal_by_id_paciente(paciente_id)
-    emat,_   = service_egreso_materno.get_egreso_materno_by_id_paciente(paciente_id)
-    anti,_   = service_anticoncepcion.get_anticoncepcion_by_id_paciente(paciente_id)
+    # Traer historial más reciente
+    hist_list_res, hist_list_code = service_historial.listar_historiales(
+        paciente_id=paciente_id, page=1, per_page=1
+    )
 
-    res, code = _ok({
-        "paciente": pac["data"],
-        "identificacion": ident["data"] if ident.get("ok") else None,
-        "antecedentes":   ant["data"]   if ant.get("ok")   else None,
-        "gestacion_actual": gest["data"] if gest.get("ok") else None,
-        "parto_aborto":   pa["data"]    if pa.get("ok")    else None,
-        "patologias":     pat["data"]   if pat.get("ok")   else None,
-        "recien_nacido":  rn["data"]    if rn.get("ok")    else None,
-        "puerperio":      puer["data"]  if puer.get("ok")  else None,
-        "egreso_neonatal": eneon["data"] if eneon.get("ok") else None,
-        "egreso_materno": emat["data"]  if emat.get("ok")  else None,
-        "anticoncepcion": anti["data"]  if anti.get("ok")  else None,
-    }, 200)
+    historial_mas_reciente = None
+    if hist_list_code == 200 and hist_list_res.get("ok"):
+        items = (hist_list_res["data"] or {}).get("items", [])
+        historial_mas_reciente = items[0] if items else None
+
+    res, code = _ok(
+        {
+            "paciente": pac_res["data"],
+            "historial": historial_mas_reciente,
+        },
+        200,
+    )
     return jsonify(res), code

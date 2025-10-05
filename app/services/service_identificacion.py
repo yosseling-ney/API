@@ -9,13 +9,11 @@ def _ok(data, code=200):
 def _fail(msg, code=400):
     return {"ok": False, "data": None, "error": msg}, code
 
-
 # ================== Enums del schema ==================
 _ETNIA = {"blanca", "indigena", "mestiza", "negra", "otros"}
 _NIVEL = {"ninguno", "primaria", "secundaria", "universitaria"}
 _ESTADO_CIVIL = {"soltera", "casada", "union_estable", "divorciada", "viuda", "otro"}
 
-# Campos requeridos del payload (paciente_id y usuario_id vienen por firma/usuario_actual)
 _REQUIRED = [
     "nombres", "apellidos", "cedula",
     "fecha_nacimiento", "edad", "etnia", "alfabeta",
@@ -23,7 +21,6 @@ _REQUIRED = [
     "domicilio", "telefono", "localidad",
     "establecimiento_salud", "lugar_parto",
 ]
-
 
 # ================== Utilidades ==================
 def _to_oid(val, field):
@@ -68,10 +65,21 @@ def _require(payload):
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
 
+def _ensure_indexes():
+    try:
+        mongo.db.identificacion.create_index("historial_id", name="ix_ident_historial")
+    except Exception:
+        pass
+    try:
+        mongo.db.identificacion.create_index("paciente_id", name="ix_ident_paciente")  # apoyo/migración
+    except Exception:
+        pass
+
 def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # apoyo/migración
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "nombres": doc.get("nombres"),
         "apellidos": doc.get("apellidos"),
@@ -93,30 +101,38 @@ def _serialize(doc: dict):
         "updated_at": doc.get("updated_at"),
     }
 
-
 # ================== Services (CRUD) ==================
 def crear_identificacion(
-    paciente_id: str,
+    historial_id: str,
     payload: dict,
     session=None,
     usuario_actual: dict | None = None
 ):
     """
-    Crea Identificación orquestada por paciente_id.
-    Requiere: paciente_id (firma), usuario_actual.usuario_id y todos los campos en _REQUIRED.
+    Crea Identificación orquestada por historial_id (FK principal).
+    Requiere: historial_id (firma), usuario_actual.usuario_id y todos los campos en _REQUIRED.
+    Opcional: paciente_id para apoyo/migración.
     """
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
         if not usuario_actual or not usuario_actual.get("usuario_id"):
             return _fail("usuario_actual.usuario_id es requerido", 422)
 
         _require(payload)
+        _ensure_indexes()
+
+        h_oid = _to_oid(historial_id, "historial_id")
+        # valida existencia del historial
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
 
         doc = {
-            "paciente_id": _to_oid(paciente_id, "paciente_id"),
+            "historial_id": h_oid,
+            **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")}
+               if payload.get("paciente_id") else {}),
             "usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id"),
             "nombres": str(payload["nombres"]).strip(),
             "apellidos": str(payload["apellidos"]).strip(),
@@ -146,7 +162,6 @@ def crear_identificacion(
     except Exception as e:
         return _fail(f"Error al guardar identificación: {str(e)}", 400)
 
-
 def obtener_identificacion_por_id(ident_id: str):
     """GET por _id del documento de identificación."""
     try:
@@ -160,9 +175,22 @@ def obtener_identificacion_por_id(ident_id: str):
     except Exception:
         return _fail("Error al obtener identificación", 400)
 
+def obtener_identificacion_por_historial(historial_id: str):
+    """GET más reciente por historial_id (FK principal)."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.identificacion.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró identificación para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception:
+        return _fail("Error al obtener identificación", 400)
 
+# ======= Compat: helpers por paciente_id (solo apoyo/migración) =======
 def get_identificacion_by_id_paciente(paciente_id: str):
-    """GET por paciente_id: devuelve la identificación más reciente del paciente."""
+    """GET por paciente_id: devuelve la identificación más reciente del paciente (compat)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.identificacion.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -174,15 +202,12 @@ def get_identificacion_by_id_paciente(paciente_id: str):
     except Exception:
         return _fail("Error al obtener identificación", 400)
 
-
-# ======= Helpers por paciente_id (simetría con otros services) =======
 def obtener_identificacion_por_paciente(paciente_id: str):
-    """Alias legible de get_identificacion_by_id_paciente."""
+    """Alias legible de get_identificacion_by_id_paciente (compat)."""
     return get_identificacion_by_id_paciente(paciente_id)
 
-
 def actualizar_identificacion_por_id(ident_id: str, payload: dict, session=None):
-    """PUT/PATCH por _id. Normaliza tipos si vienen."""
+    """PUT/PATCH por _id. Permite mover de historial validando existencia; normaliza tipos si vienen."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
@@ -190,7 +215,14 @@ def actualizar_identificacion_por_id(ident_id: str, payload: dict, session=None)
         oid = _to_oid(ident_id, "ident_id")
         upd = dict(payload)
 
-        # OIDs (soporta mover a otro paciente, no recomendado pero posible)
+        # FK principal: historial_id (validar si se cambia)
+        if "historial_id" in upd and upd["historial_id"] is not None:
+            h_oid = _to_oid(upd["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            upd["historial_id"] = h_oid
+
+        # ids auxiliares
         if "paciente_id" in upd and upd["paciente_id"]:
             upd["paciente_id"] = _to_oid(upd["paciente_id"], "paciente_id")
         if "usuario_id" in upd and upd["usuario_id"]:
@@ -227,9 +259,8 @@ def actualizar_identificacion_por_id(ident_id: str, payload: dict, session=None)
     except Exception:
         return _fail("Error al actualizar identificación", 400)
 
-
 def actualizar_identificacion_por_paciente(paciente_id: str, payload: dict, session=None):
-    """PUT/PATCH por paciente_id (sin upsert)."""
+    """PUT/PATCH por paciente_id (compat, sin upsert)."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
@@ -237,23 +268,15 @@ def actualizar_identificacion_por_paciente(paciente_id: str, payload: dict, sess
         filtro = {"paciente_id": _to_oid(paciente_id, "paciente_id")}
         upd = dict(payload)
 
-        # ids (usuario que actualiza, opcional)
         if "usuario_id" in upd and upd["usuario_id"]:
             upd["usuario_id"] = _to_oid(upd["usuario_id"], "usuario_id")
-
-        # fechas
         if "fecha_nacimiento" in upd and upd["fecha_nacimiento"]:
             upd["fecha_nacimiento"] = _as_date_ymd(upd["fecha_nacimiento"], "fecha_nacimiento")
-
-        # enteros / bools
         if "edad" in upd and upd["edad"] is not None:
             upd["edad"] = _as_int(upd["edad"], "edad", min_v=0)
-
         for b in ("alfabeta", "vive_sola"):
             if b in upd and upd[b] is not None:
                 upd[b] = _as_bool(upd[b], b)
-
-        # enums
         if "etnia" in upd and upd["etnia"]:
             upd["etnia"] = _norm_enum(upd["etnia"], _ETNIA, "etnia")
         if "nivel_estudios" in upd and upd["nivel_estudios"]:
@@ -273,7 +296,6 @@ def actualizar_identificacion_por_paciente(paciente_id: str, payload: dict, sess
     except Exception:
         return _fail("Error al actualizar identificación", 400)
 
-
 def eliminar_identificacion_por_id(ident_id: str, session=None):
     """DELETE por _id."""
     try:
@@ -287,9 +309,24 @@ def eliminar_identificacion_por_id(ident_id: str, session=None):
     except Exception:
         return _fail("Error al eliminar identificación", 400)
 
+def eliminar_identificacion_por_historial(historial_id: str, session=None):
+    """DELETE por historial_id (FK principal). Elimina la más reciente si hay varias."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.identificacion.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("Identificación no encontrada para este historial", 404)
+        res = mongo.db.identificacion.delete_one({"_id": doc["_id"]}, session=session)
+        if res.deleted_count == 0:
+            return _fail("No se pudo eliminar la identificación", 400)
+        return _ok({"mensaje": "Identificación eliminada"}, 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception:
+        return _fail("Error al eliminar identificación", 400)
 
+# Compat: borrar por paciente (apoyo/migración)
 def eliminar_identificacion_por_paciente(paciente_id: str, session=None):
-    """DELETE por paciente_id."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         res = mongo.db.identificacion.delete_one({"paciente_id": oid}, session=session)

@@ -6,22 +6,20 @@ from app import mongo
 def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
-
 # ---------------- Enums / límites del schema ----------------
 _VAC_RUBEOLA = {"previa", "embarazo", "no", "no_sabe"}
-_GRUPO_SANG = {"A", "B", "AB", "O"}
-_RH = {"+", "-"}
-_VIH_RES = {"+", "-", "s/d", "n/c"}
-_SIFILIS = {"+", "-", "s/d"}
+_GRUPO_SANG  = {"A", "B", "AB", "O"}
+_RH          = {"+", "-"}
+_VIH_RES     = {"+", "-", "s/d", "n/c"}
+_SIFILIS     = {"+", "-", "s/d"}
 
 # rangos
-_PESO_MIN, _PESO_MAX = 0.0, 300.0        # kg
-_TALLA_MIN, _TALLA_MAX = 0.5, 2.5        # m
-_HEMO_MIN, _HEMO_MAX = 0.0, 30.0         # g/dL
-_GLU_MIN = 0.0                           # mg/dL
+_PESO_MIN, _PESO_MAX   = 0.0, 300.0   # kg
+_TALLA_MIN, _TALLA_MAX = 0.5, 2.5     # m
+_HEMO_MIN, _HEMO_MAX   = 0.0, 30.0    # g/dL
+_GLU_MIN               = 0.0          # mg/dL
 
 _REQUIRED_FIELDS = [
-    # de la colec: (quitamos _id y dejamos identificacion_id opcional por orquestador)
     "peso_anterior",
     "talla",
     "fum",
@@ -60,7 +58,6 @@ _REQUIRED_FIELDS = [
     "plan_parto",
     "consejeria_lactancia",
 ]
-
 
 # ---------------- Utils ----------------
 def _to_oid(v, field):
@@ -108,10 +105,21 @@ def _require_fields(payload: dict):
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
 
+def _ensure_indexes():
+    try:
+        mongo.db.gestacion_actual.create_index("historial_id", name="ix_ga_historial_id")
+    except Exception:
+        pass
+    try:
+        mongo.db.gestacion_actual.create_index("paciente_id", name="ix_ga_paciente_id")
+    except Exception:
+        pass
+
 def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # apoyo/migración
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         # básicos
@@ -158,31 +166,37 @@ def _serialize(doc: dict):
         "updated_at": doc.get("updated_at"),
     }
 
-
 # ---------------- Services ----------------
 def crear_gestacion_actual(
-    paciente_id: str,
+    historial_id: str,
     payload: dict,
     session=None,
     usuario_actual: dict | None = None
 ):
     """
-    Crea el documento de 'gestación actual'.
-    Requiere: paciente_id (firma) + todos los campos en _REQUIRED_FIELDS.
-    Opcional: identificacion_id, usuario_actual.usuario_id.
+    Crea 'gestación actual' ORIENTADO A HISTORIAL.
+    - Firma: historial_id (FK principal).
+    - Payload: todos los campos en _REQUIRED_FIELDS.
+    - Opcionales: paciente_id, identificacion_id; usuario_actual.usuario_id para auditoría.
     """
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
 
         _require_fields(payload)
+        _ensure_indexes()
+
+        # validar FK principal
+        h_oid = _to_oid(historial_id, "historial_id")
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
 
         doc = {
-            "paciente_id": _to_oid(paciente_id, "paciente_id"),
-            **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")}
-               if payload.get("identificacion_id") else {}),
+            "historial_id": h_oid,
+            **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")} if payload.get("paciente_id") else {}),
+            **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")} if payload.get("identificacion_id") else {}),
             **({"usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id")}
                if usuario_actual and usuario_actual.get("usuario_id") else {}),
             # básicos
@@ -237,7 +251,6 @@ def crear_gestacion_actual(
     except Exception as e:
         return _fail(f"Error al guardar gestación actual: {str(e)}", 400)
 
-
 def obtener_gestacion_actual_por_id(ga_id: str):
     try:
         oid = _to_oid(ga_id, "ga_id")
@@ -250,9 +263,22 @@ def obtener_gestacion_actual_por_id(ga_id: str):
     except Exception as e:
         return _fail("Error al obtener", 400)
 
+def obtener_gestacion_actual_por_historial(historial_id: str):
+    """Devuelve la más reciente por historial_id."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.gestacion_actual.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró gestación actual para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception as e:
+        return _fail("Error al obtener", 400)
 
+# ---- Soporte legado / migración
 def get_gestacion_actual_by_id_paciente(paciente_id: str):
-    """Devuelve la más reciente por paciente_id (útil para el GET agregado)."""
+    """Más reciente por paciente_id (compat)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.gestacion_actual.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -264,9 +290,8 @@ def get_gestacion_actual_by_id_paciente(paciente_id: str):
     except Exception as e:
         return _fail("Error al obtener", 400)
 
-
 def obtener_gestacion_actual_por_identificacion(identificacion_id: str):
-    """Alternativa: por identificacion_id (devuelve la más reciente)."""
+    """Alternativa legado: por identificacion_id (más reciente)."""
     try:
         oid = _to_oid(identificacion_id, "identificacion_id")
         doc = mongo.db.gestacion_actual.find_one({"identificacion_id": oid}, sort=[("created_at", -1)])
@@ -278,10 +303,9 @@ def obtener_gestacion_actual_por_identificacion(identificacion_id: str):
     except Exception as e:
         return _fail("Error al obtener", 400)
 
-
 def actualizar_gestacion_actual_por_id(ga_id: str, payload: dict, session=None):
     """
-    Actualiza por _id. Re-normaliza fechas, enums, rangos si vienen.
+    Actualiza por _id. Permite cambiar historial_id (validando existencia) y re-normaliza fechas/enums/rangos.
     """
     try:
         if not isinstance(payload, dict):
@@ -290,7 +314,14 @@ def actualizar_gestacion_actual_por_id(ga_id: str, payload: dict, session=None):
         oid = _to_oid(ga_id, "ga_id")
         upd = dict(payload)
 
-        # ids
+        # FK principal (permitido actualizar con validación)
+        if "historial_id" in upd and upd["historial_id"] is not None:
+            h_oid = _to_oid(upd["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            upd["historial_id"] = h_oid
+
+        # ids auxiliares
         if "identificacion_id" in upd and upd["identificacion_id"]:
             upd["identificacion_id"] = _to_oid(upd["identificacion_id"], "identificacion_id")
         if "paciente_id" in upd and upd["paciente_id"]:
@@ -348,7 +379,6 @@ def actualizar_gestacion_actual_por_id(ga_id: str, payload: dict, session=None):
     except Exception as e:
         return _fail("Error al actualizar", 400)
 
-
 def eliminar_gestacion_actual_por_id(ga_id: str, session=None):
     try:
         oid = _to_oid(ga_id, "ga_id")
@@ -356,6 +386,18 @@ def eliminar_gestacion_actual_por_id(ga_id: str, session=None):
         if res.deleted_count == 0:
             return _fail("No se encontró el documento", 404)
         return _ok({"mensaje": "Gestación actual eliminada"}, 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception as e:
+        return _fail("Error al eliminar", 400)
+
+def eliminar_gestacion_actual_por_historial_id(historial_id: str, session=None):
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        res = mongo.db.gestacion_actual.delete_many({"historial_id": oid}, session=session)
+        if res.deleted_count == 0:
+            return _fail("No se encontraron documentos para este historial", 404)
+        return _ok({"mensaje": f"Se eliminaron {res.deleted_count} registros de gestación actual"}, 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
     except Exception as e:

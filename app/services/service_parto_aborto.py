@@ -6,7 +6,6 @@ from app import mongo
 def _ok(data, code=200):   return {"ok": True,  "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
-
 # ================== enums del schema ==================
 _TIPO_EVENTO = {"Parto", "Aborto"}
 _SI_NO = {"Si", "No"}
@@ -24,7 +23,6 @@ _TERMINACION = {"Espontánea","Cesárea","Fórceps","Vacuum","Otra"}
 _POSICION = {"Sentada","Acostada","Cuclillas"}
 _EPI = {"Si", "No"}
 _LIGADURA = {"Precoz","Tardía"}
-
 
 # ================== utilidades ==================
 def _to_oid(v, field):
@@ -77,10 +75,21 @@ def _require(payload, fields):
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
 
+def _ensure_indexes():
+    try:
+        mongo.db.parto_aborto.create_index("historial_id", name="ix_pa_historial")
+    except Exception:
+        pass
+    try:
+        mongo.db.parto_aborto.create_index("paciente_id", name="ix_pa_paciente")  # compat
+    except Exception:
+        pass
+
 def _serialize(doc):
     return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # compat
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "tipo_evento": doc.get("tipo_evento"),
         "fecha_ingreso": doc["fecha_ingreso"].strftime("%Y-%m-%d") if doc.get("fecha_ingreso") else None,
@@ -117,7 +126,6 @@ def _serialize(doc):
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }
-
 
 # ================== construcción del documento ==================
 _REQ_TOP = [
@@ -191,10 +199,13 @@ def _build_partograma(items):
         })
     return out
 
-def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
+def _build_doc(historial_id: str, payload: dict, usuario_actual: dict | None):
     _require(payload, _REQ_TOP)
     return {
-        "paciente_id": _to_oid(paciente_id, "paciente_id"),
+        "historial_id": _to_oid(historial_id, "historial_id"),
+        # compat (opcional): permitir guardar paciente_id si viene
+        **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")}
+           if payload.get("paciente_id") else {}),
         "usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id") if (usuario_actual and usuario_actual.get("usuario_id")) else None,
         "tipo_evento": _norm_enum(payload["tipo_evento"], _TIPO_EVENTO, "tipo_evento"),
         "fecha_ingreso": _as_date_ymd(payload["fecha_ingreso"], "fecha_ingreso"),
@@ -245,17 +256,23 @@ def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
         "updated_at": datetime.utcnow(),
     }
 
-
 # ================== services ==================
-def crear_parto_aborto(paciente_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
-    """Crea registro de parto/aborto orquestado por paciente_id."""
+def crear_parto_aborto(historial_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
+    """Crea registro de parto/aborto orquestado por historial_id (FK principal)."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
 
-        doc = _build_doc(paciente_id, payload, usuario_actual)
+        _ensure_indexes()
+
+        # validar que exista el historial
+        h_oid = _to_oid(historial_id, "historial_id")
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
+
+        doc = _build_doc(historial_id, payload, usuario_actual)
         res = (mongo.db.parto_aborto.insert_one(doc, session=session)
                if session else mongo.db.parto_aborto.insert_one(doc))
         return _ok({"id": str(res.inserted_id)}, 201)
@@ -263,7 +280,6 @@ def crear_parto_aborto(paciente_id: str, payload: dict, session=None, usuario_ac
         return _fail(str(ve), 422)
     except Exception as e:
         return _fail(f"Error al guardar parto/aborto: {str(e)}", 400)
-
 
 def obtener_parto_aborto_por_id(pa_id: str):
     try:
@@ -277,9 +293,22 @@ def obtener_parto_aborto_por_id(pa_id: str):
     except Exception:
         return _fail("Error al obtener registro", 400)
 
+def obtener_parto_aborto_por_historial(historial_id: str):
+    """Devuelve el registro más reciente para el historial_id."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.parto_aborto.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró registro para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception:
+        return _fail("Error al obtener registro", 400)
 
+# ===== Compat (apoyo/migración): búsquedas por paciente_id =====
 def get_parto_aborto_by_id_paciente(paciente_id: str):
-    """Devuelve el registro más reciente para el paciente."""
+    """Devuelve el registro más reciente para el paciente (compat)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.parto_aborto.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -291,9 +320,8 @@ def get_parto_aborto_by_id_paciente(paciente_id: str):
     except Exception:
         return _fail("Error al obtener registro", 400)
 
-
 def actualizar_parto_aborto_por_id(pa_id: str, payload: dict, session=None):
-    """Actualiza por _id (re-normaliza campos presentes en payload)."""
+    """Actualiza por _id (re-normaliza campos presentes en payload). Permite mover de historial validando existencia."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
@@ -301,7 +329,14 @@ def actualizar_parto_aborto_por_id(pa_id: str, payload: dict, session=None):
         oid = _to_oid(pa_id, "pa_id")
         upd = {}
 
-        # Permitir mover a otro paciente si viene (no recomendado).
+        # FK principal: historial_id (si viene, validar)
+        if "historial_id" in payload and payload["historial_id"] is not None:
+            h_oid = _to_oid(payload["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            upd["historial_id"] = h_oid
+
+        # compat: permitir mover a otro paciente si viene
         if "paciente_id" in payload and payload["paciente_id"]:
             upd["paciente_id"] = _to_oid(payload["paciente_id"], "paciente_id")
         if "usuario_id" in payload and payload["usuario_id"]:
@@ -397,7 +432,6 @@ def actualizar_parto_aborto_por_id(pa_id: str, payload: dict, session=None):
         return _fail(str(ve), 422)
     except Exception:
         return _fail("Error al actualizar registro", 400)
-
 
 def eliminar_parto_aborto_por_id(pa_id: str, session=None):
     try:

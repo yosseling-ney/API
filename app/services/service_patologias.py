@@ -6,7 +6,6 @@ from app import mongo
 def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
-
 # ---------------- Enums / validaciones del schema ----------------
 _SI_NO_MIN = {"si", "no"}                                   # para la mayoría de flags string
 _RES_SIF_VIH = {"positivo", "negativo", "n_r", "n_c"}       # TDP pruebas
@@ -20,7 +19,6 @@ _ENF_KEYS = [
     "infeccion_urinaria", "amenaza_parto_preter", "rciu",
     "rotura_premembranas", "anemia", "otra_cond_grave"
 ]
-
 
 # ---------------- Utils ----------------
 def _to_oid(v, field):
@@ -36,8 +34,8 @@ def _require(payload: dict, fields: list[str], where: str = ""):
         raise ValueError(pref + "Campos requeridos faltantes: " + ", ".join(faltan))
 
 def _norm_enum(v, opts: set[str], field: str):
-    if isinstance(v, str) and v.strip() in opts:
-        return v.strip()
+    if isinstance(v, str) and (vv := v.strip()) in opts:
+        return vv
     raise ValueError(f"{field} inválido; use uno de: {', '.join(sorted(opts))}")
 
 def _as_bool(v, field: str):
@@ -49,11 +47,22 @@ def _as_bool(v, field: str):
         return v.lower() == "true"
     raise ValueError(f"{field} debe ser booleano")
 
+def _ensure_indexes():
+    try:
+        mongo.db.patologias.create_index("historial_id", name="ix_pat_historial")
+    except Exception:
+        pass
+    try:
+        mongo.db.patologias.create_index("paciente_id", name="ix_pat_paciente")  # compat
+    except Exception:
+        pass
+
 def _serialize(doc: dict):
     """Convierte ObjectIds/fechas a string para respuesta."""
-    out = {
+    return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # compat
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "enfermedades": doc.get("enfermedades"),
@@ -63,16 +72,11 @@ def _serialize(doc: dict):
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }
-    return out
-
 
 # ---------------- Builders ----------------
 def _build_enfermedades(enf: dict) -> dict:
     _require(enf, _ENF_KEYS, "enfermedades")
-    dto = {}
-    for k in _ENF_KEYS:
-        dto[k] = _norm_enum(enf[k], _SI_NO_MIN, f"enfermedades.{k}")
-    return dto
+    return {k: _norm_enum(enf[k], _SI_NO_MIN, f"enfermedades.{k}") for k in _ENF_KEYS}
 
 def _build_resumen(res: dict) -> dict:
     _require(res, ["ninguna", "uno_o_mas"], "resumen")
@@ -83,17 +87,15 @@ def _build_resumen(res: dict) -> dict:
 
 def _build_hemorragia(he: dict) -> dict:
     _require(he, ["hemorragia_ocurrio", "trimestre", "codigo"], "hemorragia")
-    dto = {
+    if not isinstance(he.get("codigo"), list):
+        raise ValueError("hemorragia.codigo debe ser arreglo de strings (máx 3)")
+    if len(he["codigo"]) > 3:
+        raise ValueError("hemorragia.codigo admite hasta 3 códigos")
+    return {
         "hemorragia_ocurrio": _norm_enum(he["hemorragia_ocurrio"], _SI_NO_MIN, "hemorragia.hemorragia_ocurrio"),
         "trimestre": _norm_enum(he["trimestre"], _HEM_TRIM, "hemorragia.trimestre"),
+        "codigo": [str(x) for x in he["codigo"]],
     }
-    cod = he.get("codigo", [])
-    if not isinstance(cod, list):
-        raise ValueError("hemorragia.codigo debe ser arreglo de strings (máx 3)")
-    if len(cod) > 3:
-        raise ValueError("hemorragia.codigo admite hasta 3 códigos")
-    dto["codigo"] = [str(x) for x in cod]
-    return dto
 
 def _build_tdp(tdp: dict) -> dict:
     _require(tdp, ["prueba_sifilis", "prueba_vih", "tarv"], "tdp")
@@ -103,11 +105,14 @@ def _build_tdp(tdp: dict) -> dict:
         "tarv": _norm_enum(tdp["tarv"], _TARV, "tdp.tarv"),
     }
 
-def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
+def _build_doc(historial_id: str, payload: dict, usuario_actual: dict | None):
     _require(payload, ["enfermedades", "resumen", "hemorragia", "tdp"])
     return {
-        "paciente_id": _to_oid(paciente_id, "paciente_id"),
-        # identificacion_id puede venir o no (lo dejamos opcional por orquestación)
+        "historial_id": _to_oid(historial_id, "historial_id"),
+        # compat: permitir guardar paciente_id si viene
+        **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")}
+           if payload.get("paciente_id") else {}),
+        # identificacion_id opcional
         **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")}
            if payload.get("identificacion_id") else {}),
         "usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id") if (usuario_actual and usuario_actual.get("usuario_id")) else None,
@@ -119,17 +124,23 @@ def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
         "updated_at": datetime.utcnow(),
     }
 
-
 # ---------------- Services ----------------
-def crear_patologias(paciente_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
-    """Crea el documento de patologías para un paciente (orquestado por paciente_id)."""
+def crear_patologias(historial_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
+    """Crea el documento de patologías (FK principal: historial_id)."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
 
-        doc = _build_doc(paciente_id, payload, usuario_actual)
+        _ensure_indexes()
+
+        # validar existencia del historial
+        h_oid = _to_oid(historial_id, "historial_id")
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
+
+        doc = _build_doc(historial_id, payload, usuario_actual)
         res = mongo.db.patologias.insert_one(doc, session=session) if session else mongo.db.patologias.insert_one(doc)
         return _ok({"id": str(res.inserted_id)}, 201)
 
@@ -137,7 +148,6 @@ def crear_patologias(paciente_id: str, payload: dict, session=None, usuario_actu
         return _fail(str(ve), 422)
     except Exception as e:
         return _fail(f"Error al guardar patologías: {str(e)}", 400)
-
 
 def obtener_patologias_por_id(pat_id: str):
     try:
@@ -151,9 +161,22 @@ def obtener_patologias_por_id(pat_id: str):
     except Exception:
         return _fail("Error al obtener", 400)
 
+def obtener_patologias_por_historial(historial_id: str):
+    """Devuelve la más reciente por historial_id."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.patologias.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró registro de patologías para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception:
+        return _fail("Error al obtener", 400)
 
+# ------- Compat (apoyo/migración) por paciente_id -------
 def get_patologias_by_id_paciente(paciente_id: str):
-    """Devuelve la más reciente por paciente_id (para el GET agregado/orquestador)."""
+    """Devuelve la más reciente por paciente_id (compatibilidad)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.patologias.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -165,9 +188,8 @@ def get_patologias_by_id_paciente(paciente_id: str):
     except Exception:
         return _fail("Error al obtener", 400)
 
-
 def actualizar_patologias_por_id(pat_id: str, payload: dict, session=None):
-    """Actualiza por _id. Re-valida y normaliza únicamente los campos presentes."""
+    """Actualiza por _id. Re-valida y normaliza únicamente los campos presentes. Soporta mover de historial validando existencia."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
@@ -175,7 +197,14 @@ def actualizar_patologias_por_id(pat_id: str, payload: dict, session=None):
         oid = _to_oid(pat_id, "pat_id")
         upd = {}
 
-        # opcionalmente mover vínculos
+        # FK principal: historial_id (si viene, validar)
+        if "historial_id" in payload and payload["historial_id"] is not None:
+            h_oid = _to_oid(payload["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            upd["historial_id"] = h_oid
+
+        # compat (opcional)
         if "paciente_id" in payload and payload["paciente_id"]:
             upd["paciente_id"] = _to_oid(payload["paciente_id"], "paciente_id")
         if "identificacion_id" in payload and payload["identificacion_id"]:
@@ -186,13 +215,10 @@ def actualizar_patologias_por_id(pat_id: str, payload: dict, session=None):
         # bloques anidados
         if "enfermedades" in payload and payload["enfermedades"]:
             upd["enfermedades"] = _build_enfermedades(payload["enfermedades"])
-
         if "resumen" in payload and payload["resumen"]:
             upd["resumen"] = _build_resumen(payload["resumen"])
-
         if "hemorragia" in payload and payload["hemorragia"]:
             upd["hemorragia"] = _build_hemorragia(payload["hemorragia"])
-
         if "tdp" in payload and payload["tdp"]:
             upd["tdp"] = _build_tdp(payload["tdp"])
 
@@ -210,7 +236,6 @@ def actualizar_patologias_por_id(pat_id: str, payload: dict, session=None):
         return _fail(str(ve), 422)
     except Exception:
         return _fail("Error al actualizar", 400)
-
 
 def eliminar_patologias_por_id(pat_id: str, session=None):
     try:

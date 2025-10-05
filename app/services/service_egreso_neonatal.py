@@ -3,24 +3,18 @@ from bson import ObjectId
 from app import mongo
 
 # ---------------- Respuestas estándar ----------------
-def _ok(data, code=200):
-    return {"ok": True, "data": data, "error": None}, code
-
-def _fail(msg, code=400):
-    return {"ok": False, "data": None, "error": msg}, code
-
+def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, code
+def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
 # ---------------- Constantes / Utilidades ----------------
-_ESTADO_ENUM = {"vivo", "traslado", "fallece"}
-_SI_NO_ENUM = {"si", "no"}
+_ESTADO_ENUM   = {"vivo", "traslado", "fallece"}
+_SI_NO_ENUM    = {"si", "no"}
 _ALIMENTO_ENUM = {"lact_exclusiva", "lact_no_exclusiva", "leche_artificial"}
 
-_REQUIRED_FIELDS = [
-    # del orquestador: paciente_id es requerido en la FIRMA, no en el payload
+# Campos siempre requeridos en el payload (los condicionales se validan aparte)
+_REQUIRED_CORE = [
     "estado",
     "fecha_hora_evento",
-    "codigo_traslado",            # si estado == traslado, debe venir no-vacío
-    "fallece_durante_traslado",   # si estado == traslado, enum si/no
     "edad_egreso_dias",
     "id_rn",
     "alimento_alta",
@@ -64,8 +58,7 @@ def _as_nonneg_float(v, field):
 
 def _parse_dt(dt_str: str, field="fecha_hora_evento"):
     """
-    Acepta "YYYY-MM-DD HH:MM" o "DD/MM/YYYY HH:MM".
-    Si te llega solo fecha "YYYY-MM-DD" ó "DD/MM/YYYY", asume 00:00.
+    Acepta "YYYY-MM-DD HH:MM" o "DD/MM/YYYY HH:MM" o solo fecha ("YYYY-MM-DD" / "DD/MM/YYYY", asumiendo 00:00).
     """
     if not isinstance(dt_str, str):
         raise ValueError(f"{field} debe ser string")
@@ -80,26 +73,37 @@ def _parse_dt(dt_str: str, field="fecha_hora_evento"):
             continue
     raise ValueError(f"{field} debe tener formato 'YYYY-MM-DD HH:MM' o 'DD/MM/YYYY HH:MM'")
 
-def _require_fields(payload: dict):
-    faltan = [f for f in _REQUIRED_FIELDS if f not in payload]
+def _require_core(payload: dict):
+    faltan = [f for f in _REQUIRED_CORE if f not in payload]
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
+
+def _ensure_indexes():
+    try:
+        mongo.db.egreso_neonatal.create_index("historial_id", name="ix_en_historial_id")
+    except Exception:
+        pass
+    try:
+        mongo.db.egreso_neonatal.create_index("paciente_id", name="ix_en_paciente_id")
+    except Exception:
+        pass
 
 def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # apoyo/migración
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "estado": doc.get("estado"),  # 'vivo' | 'traslado' | 'fallece'
         "fecha_hora_evento": doc["fecha_hora_evento"].strftime("%Y-%m-%d %H:%M") if doc.get("fecha_hora_evento") else None,
         "codigo_traslado": doc.get("codigo_traslado"),
-        "fallece_durante_traslado": doc.get("fallece_durante_traslado"),  # 'si' | 'no'
+        "fallece_durante_traslado": doc.get("fallece_durante_traslado"),  # 'si' | 'no' | None
         "edad_egreso_dias": doc.get("edad_egreso_dias"),
         "id_rn": doc.get("id_rn"),
-        "alimento_alta": doc.get("alimento_alta"),        # enum alimento
-        "boca_arriba": doc.get("boca_arriba"),            # 'si' | 'no'
-        "bcg_aplicada": doc.get("bcg_aplicada"),          # 'si' | 'no'
+        "alimento_alta": doc.get("alimento_alta"),
+        "boca_arriba": doc.get("boca_arriba"),
+        "bcg_aplicada": doc.get("bcg_aplicada"),
         "peso_egreso": doc.get("peso_egreso"),
         "nombre_rn": doc.get("nombre_rn"),
         "responsable": doc.get("responsable"),
@@ -107,28 +111,33 @@ def _serialize(doc: dict):
         "updated_at": doc.get("updated_at"),
     }
 
-
 # ---------------- Services ----------------
 def crear_egreso_neonatal(
-    paciente_id: str,
+    historial_id: str,
     payload: dict,
     session=None,
     usuario_actual: dict | None = None
 ):
     """
-    Crea egreso RN.
-    Requiere en la firma: paciente_id.
-    Requiere en payload: campos de _REQUIRED_FIELDS.
-    Opcionales: identificacion_id. usuario_actual.usuario_id (recomendado para auditoría).
+    Crea egreso RN ORIENTADO A HISTORIAL.
+    Firma: historial_id (FK principal).
+    Payload (núcleo): _REQUIRED_CORE.
+    Condicionales: si estado == 'traslado' => codigo_traslado (no vacío) y fallece_durante_traslado ('si'|'no').
+    Opcionales: paciente_id, identificacion_id. usuario_actual.usuario_id para auditoría.
     """
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
 
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        _require_core(payload)
+        _ensure_indexes()
 
-        _require_fields(payload)
+        # validar FK principal
+        h_oid = _to_oid(historial_id, "historial_id")
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
 
         estado = _norm_enum(payload["estado"], _ESTADO_ENUM, "estado")
         fecha_dt = _parse_dt(payload["fecha_hora_evento"], "fecha_hora_evento")
@@ -141,27 +150,28 @@ def crear_egreso_neonatal(
 
         # Validaciones condicionales por estado
         codigo_traslado = (payload.get("codigo_traslado") or "").strip()
-        fallece_durante_traslado = _norm_enum(payload["fallece_durante_traslado"], _SI_NO_ENUM, "fallece_durante_traslado")
+        fallece_valor = payload.get("fallece_durante_traslado")
+        fallece_durante_traslado = None
 
         if estado == "traslado":
             if not codigo_traslado:
                 return _fail("Si estado = 'traslado', 'codigo_traslado' es obligatorio", 422)
+            if fallece_valor is None:
+                return _fail("Si estado = 'traslado', 'fallece_durante_traslado' es obligatorio ('si'|'no')", 422)
+            fallece_durante_traslado = _norm_enum(fallece_valor, _SI_NO_ENUM, "fallece_durante_traslado")
         else:
-            # si no es traslado, podemos limpiar estos campos
-            if not codigo_traslado:
-                codigo_traslado = None
+            # En 'vivo' o 'fallece' no aplica traslado
+            codigo_traslado = None
             fallece_durante_traslado = None
 
         doc = {
-            "paciente_id": _to_oid(paciente_id, "paciente_id"),
-            **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")}
-               if payload.get("identificacion_id") else {}),
+            "historial_id": h_oid,
+            **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")} if payload.get("paciente_id") else {}),
+            **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")} if payload.get("identificacion_id") else {}),
             **({"usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id")}
                if usuario_actual and usuario_actual.get("usuario_id") else {}),
             "estado": estado,
             "fecha_hora_evento": fecha_dt,
-            "codigo_traslado": codigo_traslado,
-            "fallece_durante_traslado": fallece_durante_traslado,
             "edad_egreso_dias": edad_dias,
             "id_rn": str(payload["id_rn"]).strip(),
             "alimento_alta": alimento,
@@ -174,6 +184,10 @@ def crear_egreso_neonatal(
             "updated_at": datetime.utcnow(),
         }
 
+        if codigo_traslado is not None:
+            doc["codigo_traslado"] = codigo_traslado
+        if fallece_durante_traslado is not None:
+            doc["fallece_durante_traslado"] = fallece_durante_traslado
         res = mongo.db.egreso_neonatal.insert_one(doc, session=session) if session else mongo.db.egreso_neonatal.insert_one(doc)
         return _ok({"id": str(res.inserted_id)}, 201)
 
@@ -181,7 +195,6 @@ def crear_egreso_neonatal(
         return _fail(str(ve), 422)
     except Exception as e:
         return _fail(f"Error al registrar egreso neonatal: {str(e)}", 400)
-
 
 def obtener_egreso_neonatal_por_id(egreso_id: str):
     try:
@@ -195,11 +208,22 @@ def obtener_egreso_neonatal_por_id(egreso_id: str):
     except Exception as e:
         return _fail("Error al obtener datos", 400)
 
+def obtener_egreso_neonatal_por_historial(historial_id: str):
+    """Devuelve el registro más reciente por historial_id."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.egreso_neonatal.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró egreso neonatal para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception as e:
+        return _fail("Error al obtener datos", 400)
 
+# ---- Soporte/migración (opcional)
 def get_egreso_neonatal_by_id_paciente(paciente_id: str):
-    """
-    Devuelve el más reciente por paciente_id (por si existen varios).
-    """
+    """Más reciente por paciente_id (soporte legado)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.egreso_neonatal.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -211,31 +235,34 @@ def get_egreso_neonatal_by_id_paciente(paciente_id: str):
     except Exception as e:
         return _fail("Error al obtener datos", 400)
 
-
-def obtener_egreso_neonatal_por_identificacion(identificacion_id: str):
-    try:
-        oid = _to_oid(identificacion_id, "identificacion_id")
-        doc = mongo.db.egreso_neonatal.find_one({"identificacion_id": oid})
-        if not doc:
-            return _fail("No se encontró egreso neonatal para esta identificación", 404)
-        return _ok(_serialize(doc), 200)
-    except ValueError as ve:
-        return _fail(str(ve), 422)
-    except Exception as e:
-        return _fail("Error al obtener datos", 400)
-
-
 def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=None):
     """
-    Actualiza por _id. Re-normaliza enums y fecha si vienen.
+    Actualiza por _id. Permite cambiar historial_id (validando existencia).
+    Re-normaliza enums y fecha si vienen y aplica coherencias de traslado.
     """
-    try        :
+    try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
 
         oid = _to_oid(egreso_id, "egreso_id")
         update = dict(payload)
 
+        # FK principal
+        if "historial_id" in update and update["historial_id"] is not None:
+            h_oid = _to_oid(update["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            update["historial_id"] = h_oid
+
+        # Auxiliares
+        if "identificacion_id" in update and update["identificacion_id"]:
+            update["identificacion_id"] = _to_oid(update["identificacion_id"], "identificacion_id")
+        if "paciente_id" in update and update["paciente_id"]:
+            update["paciente_id"] = _to_oid(update["paciente_id"], "paciente_id")
+        if "usuario_id" in update and update["usuario_id"]:
+            update["usuario_id"] = _to_oid(update["usuario_id"], "usuario_id")
+
+        # Campos con normalización
         if "estado" in update and update["estado"] is not None:
             update["estado"] = _norm_enum(update["estado"], _ESTADO_ENUM, "estado")
 
@@ -263,21 +290,20 @@ def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=Non
         if "bcg_aplicada" in update and update["bcg_aplicada"] is not None:
             update["bcg_aplicada"] = _norm_enum(update["bcg_aplicada"], _SI_NO_ENUM, "bcg_aplicada")
 
-        if "identificacion_id" in update and update["identificacion_id"]:
-            update["identificacion_id"] = _to_oid(update["identificacion_id"], "identificacion_id")
-
-        if "paciente_id" in update and update["paciente_id"]:
-            update["paciente_id"] = _to_oid(update["paciente_id"], "paciente_id")
-
-        if "usuario_id" in update and update["usuario_id"]:
-            update["usuario_id"] = _to_oid(update["usuario_id"], "usuario_id")
-
-        # coherencia condicional si estado no es traslado
-        if update.get("estado") and update["estado"] != "traslado":
-            if "codigo_traslado" in update and not update["codigo_traslado"]:
-                update["codigo_traslado"] = None
-            if "fallece_durante_traslado" in update:
-                update["fallece_durante_traslado"] = None
+        # Coherencia condicional según estado (solo si estado está presente en el update)
+        if "estado" in update:
+            if update["estado"] == "traslado":
+                # En traslado: exigir que codigo_traslado (si vino) no sea vacío y normalizar fallece_durante_traslado
+                if "codigo_traslado" in update and not update["codigo_traslado"]:
+                    return _fail("Si estado = 'traslado', 'codigo_traslado' no puede ser vacío", 422)
+                if "fallece_durante_traslado" in update and update["fallece_durante_traslado"] is None:
+                    return _fail("Si estado = 'traslado', 'fallece_durante_traslado' es obligatorio ('si'|'no')", 422)
+            else:
+                # En vivo/fallece: no aplica traslado
+                if "codigo_traslado" in update:
+                    update["codigo_traslado"] = None
+                if "fallece_durante_traslado" in update:
+                    update["fallece_durante_traslado"] = None
 
         update["updated_at"] = datetime.utcnow()
 
@@ -291,7 +317,6 @@ def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=Non
     except Exception as e:
         return _fail("Error al actualizar", 400)
 
-
 def eliminar_egreso_neonatal_por_id(egreso_id: str, session=None):
     try:
         oid = _to_oid(egreso_id, "egreso_id")
@@ -299,6 +324,18 @@ def eliminar_egreso_neonatal_por_id(egreso_id: str, session=None):
         if res.deleted_count == 0:
             return _fail("No se encontró el documento", 404)
         return _ok({"mensaje": "Egreso neonatal eliminado"}, 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception as e:
+        return _fail("Error al eliminar", 400)
+
+def eliminar_egreso_neonatal_por_historial_id(historial_id: str, session=None):
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        res = mongo.db.egreso_neonatal.delete_many({"historial_id": oid}, session=session)
+        if res.deleted_count == 0:
+            return _fail("No se encontraron documentos para este historial", 404)
+        return _ok({"mensaje": f"Se eliminaron {res.deleted_count} egresos neonatales"}, 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
     except Exception as e:

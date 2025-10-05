@@ -23,42 +23,67 @@ def init_indexes():
     db = get_db()
 
     # ---------------- pacientes ----------------
-    _safe_create("pacientes", [("identificacion", ASCENDING)], name="uq_identificacion", unique=True)
-    _safe_create("pacientes", [("codigo_expediente", ASCENDING)], name="uq_codigo_expediente", unique=True)
+    _safe_create("paciente", [("identificacion", ASCENDING)], name="uq_identificacion", unique=True)
+    _safe_create("paciente", [("codigo_expediente", ASCENDING)], name="uq_codigo_expediente", unique=True)
+
+    # ---------------- historiales ----------------
+    _safe_create("historiales", [("paciente_id", ASCENDING), ("numero_gesta", ASCENDING)],
+                 name="uq_paciente_gesta", unique=True)
+    _safe_create("historiales", [("paciente_id", ASCENDING)], name="ix_paciente")
+    _safe_create("historiales", [("created_at", DESCENDING), ("numero_gesta", DESCENDING)],
+                 name="ix_created_gesta")
+    for ref in [
+        "identificacion_id", "antecedentes_id", "gestacion_actual_id",
+        "parto_aborto_id", "patologias_id", "recien_nacido_id",
+        "puerperio_id", "egreso_neonatal_id", "egreso_materno_id",
+        "anticoncepcion_id"
+    ]:
+        _safe_create("historiales", [(ref, ASCENDING)], name=f"ix_{ref}")
 
     # ---------------- identificacion ----------------
-    _safe_create("identificacion", [("paciente_id", ASCENDING)], name="paciente_idx")
+    _safe_create("identificacion", [("historial_id", ASCENDING)], name="historial_idx")
     _safe_create("identificacion", [("created_at", DESCENDING)], name="created_desc_idx")
 
     # ---------------- antecedentes ----------------
-    _safe_create("antecedentes", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("antecedentes", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     # ---------------- gestacion_actual ----------------
-    _safe_create("gestacion_actual", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("gestacion_actual", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     # ---------------- parto_aborto ----------------
-    _safe_create("parto_aborto", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
-    _safe_create("parto_aborto", [("paciente_id", ASCENDING), ("fecha_ingreso", DESCENDING)], name="paciente_fecha_ingreso_idx")
+    _safe_create("parto_aborto", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
+    _safe_create("parto_aborto", [("historial_id", ASCENDING), ("fecha_ingreso", DESCENDING)],
+                 name="historial_fecha_ingreso_idx")
     _safe_create("parto_aborto", [("fecha_ingreso", DESCENDING)], name="fecha_ingreso_idx")  # opcional
 
     # ---------------- patologias ----------------
-    _safe_create("patologias", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("patologias", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
-    # ---------------- recien_nacido ----------------
-    _safe_create("recien_nacido", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    # ---------------- recien_nacidos (ojo: plural) ----------------
+    _safe_create("recien_nacidos", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     # ---------------- puerperio ----------------
-    _safe_create("puerperio", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("puerperio", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     # ---------------- egreso_neonatal ----------------
-    _safe_create("egreso_neonatal", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("egreso_neonatal", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     # ---------------- egreso_materno ----------------
-    _safe_create("egreso_materno", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
-    _safe_create("egreso_materno", [("paciente_id", ASCENDING), ("egreso_materno.fecha", DESCENDING)], name="paciente_fecha_egreso_idx")
+    _safe_create("egreso_materno", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
+    _safe_create("egreso_materno", [("egreso_materno.fecha", DESCENDING)],
+                 name="paciente_fecha_egreso_idx")  # si ese path existe
 
     # ---------------- anticoncepcion ----------------
-    _safe_create("anticoncepcion", [("paciente_id", ASCENDING), ("created_at", DESCENDING)], name="paciente_created_desc_idx")
+    _safe_create("anticoncepcion", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="historial_created_desc_idx")
 
     print("[indexes] OK – índices creados/actualizados")
 

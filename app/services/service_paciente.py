@@ -1,72 +1,24 @@
 from datetime import datetime
 import re
 from bson import ObjectId
+from flask import current_app
 from app import mongo
 
-# (opcionales) importaciones de otros servicios para el GET agregado
+# (opcional) importación del servicio de historiales para agregados
 try:
-    from app.services import service_antencedentes as svc_ant  # nombre original del usuario
+    from app.services import service_historial as svc_his
 except Exception:
-    svc_ant = None
-
-try:
-    from app.services import service_identificacion as svc_ident
-except Exception:
-    svc_ident = None
-
-try:
-    from app.services import service_gestacion_actual as svc_ga
-except Exception:
-    svc_ga = None
-
-try:
-    from app.services import service_parto_aborto as svc_pa
-except Exception:
-    svc_pa = None
-
-try:
-    from app.services import service_patologias as svc_pat
-except Exception:
-    svc_pat = None
-
-try:
-    from app.services import service_puerperio as svc_puer
-except Exception:
-    svc_puer = None
-
-try:
-    from app.services import service_recien_nacido as svc_rn
-except Exception:
-    svc_rn = None
-
-try:
-    from app.services import service_egreso_neonatal as svc_en
-except Exception:
-    svc_en = None
-
-try:
-    from app.services import service_egreso_materno as svc_em
-except Exception:
-    svc_em = None
-
-try:
-    from app.services import service_anticoncepcion as svc_antico
-except Exception:
-    svc_antico = None
-
+    svc_his = None
 
 # ---------------- Respuestas estándar ----------------
 def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
-
 # ---------------- Reglas / patrones ----------------
 _RE_CEDULA = re.compile(r"^\d{3}-\d{6}-\d{4}[A-Z]{1}$")
 _RE_EXPED  = re.compile(r"^\d{3}[A-Z9]{4}[MF]\d{6}\d{2}$")
 _RE_TEL    = re.compile(r"^[0-9\+\-\s]{8,15}$")
-
 _ARTICULOS = {"DE", "DEL", "LA", "LOS", "LAS", "DA", "DO", "DOS", "DAS"}
-
 
 # ---------------- Utils ----------------
 def _to_oid(v, field):
@@ -89,18 +41,21 @@ def _norm_upper(s):
     return s.strip().upper() if isinstance(s, str) else s
 
 def _ensure_indexes():
-    # Únicos recomendados
     try:
-        mongo.db.pacientes.create_index("identificacion", unique=True, name="uq_identificacion")
+        mongo.db.paciente.create_index("identificacion", unique=True, name="uq_identificacion")
     except Exception:
         pass
     try:
-        mongo.db.pacientes.create_index("codigo_expediente", unique=True, name="uq_codigo_expediente")
+        mongo.db.paciente.create_index("codigo_expediente", unique=True, name="uq_codigo_expediente")
+    except Exception:
+        pass
+    try:
+        mongo.db.paciente.create_index("historial_id", name="ix_historial_id")  # no-único, opcional
     except Exception:
         pass
 
 def _validar_cedula(c):
-    if not isinstance(c, str): 
+    if not isinstance(c, str):
         raise ValueError("identificacion debe ser string")
     c = _norm_upper(c)
     if not _RE_CEDULA.match(c):
@@ -139,16 +94,8 @@ def _tomar_inicial(palabra: str) -> str:
     return p[0] if p and p[0].isalpha() else "9"
 
 def _extraer_iniciales(nombre: str, apellido: str) -> str:
-    """
-    Retorna 4 caracteres (A-Z o 9):
-    - 1er y 2do nombre (si no existe 2do => '9')
-    - 1er y 2do apellido (si no existe 2do => '9')
-    Ignora artículos comunes.
-    """
-    # nombres
     n_tokens = [_norm_upper(t) for t in (nombre or "").split() if _norm_upper(t) not in _ARTICULOS]
     a_tokens = [_norm_upper(t) for t in (apellido or "").split() if _norm_upper(t) not in _ARTICULOS]
-
     n1 = _tomar_inicial(n_tokens[0]) if len(n_tokens) >= 1 else "9"
     n2 = _tomar_inicial(n_tokens[1]) if len(n_tokens) >= 2 else "9"
     a1 = _tomar_inicial(a_tokens[0]) if len(a_tokens) >= 1 else "9"
@@ -159,14 +106,6 @@ def _generar_codigo_expediente(nombre, apellido, fecha_nac_dt: datetime,
                                sexo: str | None = None,
                                municipio_codigo: str | None = None,
                                control: int | None = None) -> str:
-    """
-    MMM + IIII + S + DDMMAA + CC
-    - MMM: 3 dígitos (por defecto '800' si no se envía)
-    - IIII: iniciales (A-Z) o '9' como comodín
-    - S: 'M' | 'F' (por defecto 'F' dado el contexto obstétrico)
-    - DDMMAA: desde fecha_nac
-    - CC: control 00..99 (si no se envía, usa 00 y luego intenta incrementar si colisiona)
-    """
     mmm = (municipio_codigo or "800").strip()
     if not re.match(r"^\d{3}$", mmm):
         raise ValueError("municipio_codigo debe ser 3 dígitos (ej. '161' o '800')")
@@ -184,6 +123,7 @@ def _generar_codigo_expediente(nombre, apellido, fecha_nac_dt: datetime,
 def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
+        "historial_id": str(doc.get("historial_id")) if isinstance(doc.get("historial_id"), ObjectId) else (doc.get("historial_id") or None),
         "nombre": doc.get("nombre"),
         "apellido": doc.get("apellido"),
         "identificacion": doc.get("identificacion"),
@@ -199,31 +139,24 @@ def _serialize(doc: dict):
         "updated_at": doc.get("updated_at"),
     }
 
-
 # ---------------- Services ----------------
 def buscar_paciente_por_cedula(identificacion: str):
-    """Busca por cédula exacta (normalizada)."""
     try:
         ident = _validar_cedula(identificacion)
-        doc = mongo.db.pacientes.find_one({"identificacion": ident})
+        doc = mongo.db.paciente.find_one({"identificacion": ident})
         if not doc:
             return _fail("No existe paciente con esa identificación", 404)
         return _ok(_serialize(doc), 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al buscar paciente", 400)
-
 
 def crear_paciente(payload: dict, session=None):
     """
-    Crea un paciente nuevo.
-    Comportamiento:
-      - Si ya existe por 'identificacion' => 409 y retorno del existente.
-      - Genera 'codigo_expediente' siguiendo el patrón MINSA.
-        * sexo (opcional, default 'F').
-        * municipio_codigo (opcional, default '800').
-        * control se ajusta si hay colisión.
+    Crea un paciente. `historial_id` es OPCIONAL:
+      - Si viene, debe ser ObjectId válido y existir en `historiales` (FK suave).
+      - Si no viene, el paciente queda sin historial asociado.
     """
     try:
         if not isinstance(payload, dict):
@@ -240,25 +173,32 @@ def crear_paciente(payload: dict, session=None):
         bairro    = _validar_min_nonempty(payload.get("bairro"), "bairro")
         gesta_actual = _validar_gesta_actual(payload.get("gesta_actual"))
 
-        # ¿paciente ya existe?
-        ya = mongo.db.pacientes.find_one({"identificacion": identificacion})
+        # ya existe?
+        ya = mongo.db.paciente.find_one({"identificacion": identificacion})
         if ya:
-            # 409 -> conflicto: ya existe. Devolvemos el existente.
             return {"ok": False, "data": _serialize(ya), "error": "Paciente ya existe"}, 409
 
-        # opcionales para codigo_expediente
-        municipio_codigo = payload.get("municipio_codigo")  # "161", "800", etc.
+        # opcionales codigo_expediente
+        municipio_codigo = payload.get("municipio_codigo")
         sexo = (payload.get("sexo") or "F").upper()
 
-        # Generar codigo_expediente y resolver posibles colisiones incrementando CC
+        # Generar codigo_expediente único
         control = 0
         while control <= 99:
             codigo = _generar_codigo_expediente(nombre, apellido, fecha_nac_dt, sexo, municipio_codigo, control)
-            if not mongo.db.pacientes.find_one({"codigo_expediente": codigo}):
+            if not mongo.db.paciente.find_one({"codigo_expediente": codigo}):
                 break
             control += 1
         if control > 99:
             return _fail("No se pudo generar un codigo_expediente único (CC agotado)", 400)
+
+        # historial_id opcional
+        historial_oid = None
+        if payload.get("historial_id") not in (None, "",):
+            historial_oid = _to_oid(payload.get("historial_id"), "historial_id")
+            # Validar existencia del historial (FK suave)
+            if not mongo.db.historiales.find_one({"_id": historial_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
 
         doc = {
             "nombre": nombre.strip(),
@@ -270,36 +210,46 @@ def crear_paciente(payload: dict, session=None):
             "direccion": direccion,
             "bairro": bairro,
             "gesta_actual": gesta_actual,
-            "contacto_emergencia": None,
             "activo": True,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
 
-        # contacto_emergencia opcional (si viene)
+        if historial_oid is not None:
+            doc["historial_id"] = historial_oid  # solo guardar si existe
+
         ce = payload.get("contacto_emergencia")
         if isinstance(ce, dict):
             ce_nombre = _validar_min_nonempty(ce.get("nombre"), "contacto_emergencia.nombre")
             ce_tel    = _validar_telefono(ce.get("telefono"))
             doc["contacto_emergencia"] = {"nombre": ce_nombre, "telefono": ce_tel}
 
-        res = mongo.db.pacientes.insert_one(doc, session=session) if session else mongo.db.pacientes.insert_one(doc)
+        try:
+            current_app.logger.info(f"[pacientes] Insert doc: {doc}")
+        except Exception:
+            pass
+
+        res = (mongo.db.paciente.insert_one(doc, session=session)
+               if session else mongo.db.paciente.insert_one(doc))
         return _ok({"id": str(res.inserted_id), "codigo_expediente": codigo}, 201)
 
     except ValueError as ve:
         return _fail(str(ve), 422)
     except Exception as e:
-        # Si es por índice único, intenta detectarlo
         msg = str(e)
+        try:
+            current_app.logger.exception("Error al crear paciente")
+        except Exception:
+            pass
         if "duplicate key" in msg.lower():
             return _fail("Duplicado: identificacion o codigo_expediente ya existen", 409)
-        return _fail("Error al crear paciente", 400)
-
+        return _fail(f"Error al crear paciente: {msg}", 400)
 
 def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
     """
-    Actualiza datos básicos (NO regenera codigo_expediente salvo que se pida explícito).
-    Si cambias nombre/apellido/fecha_nac y quieres re-generar el código, envía regenerate_codigo=True.
+    Permite actualizar campos básicos y opcionalmente:
+      - setear `historial_id` (validando existencia),
+      - o limpiarlo pasando null/None.
     """
     try:
         if not isinstance(payload, dict):
@@ -308,58 +258,50 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
         oid = _to_oid(paciente_id, "paciente_id")
         upd = {}
 
+        if "historial_id" in payload:
+            h = payload.get("historial_id")
+            if h in (None, ""):
+                upd["historial_id"] = None
+            else:
+                h_oid = _to_oid(h, "historial_id")
+                if not mongo.db.historiales.find_one({"_id": h_oid}):
+                    return _fail("historial_id no encontrado en historiales", 404)
+                upd["historial_id"] = h_oid
+
         if "nombre" in payload and payload["nombre"] is not None:
             upd["nombre"] = _validar_min_nonempty(payload["nombre"], "nombre")
-
         if "apellido" in payload and payload["apellido"] is not None:
             upd["apellido"] = _validar_min_nonempty(payload["apellido"], "apellido")
-
         if "identificacion" in payload and payload["identificacion"] is not None:
             upd["identificacion"] = _validar_cedula(payload["identificacion"])
-
         if "fecha_nac" in payload and payload["fecha_nac"] is not None:
             upd["fecha_nac"] = _parse_date_ymd(payload["fecha_nac"], "fecha_nac")
-
         if "telefono" in payload and payload["telefono"] is not None:
             upd["telefono"] = _validar_telefono(payload["telefono"])
-
         if "direccion" in payload and payload["direccion"] is not None:
             upd["direccion"] = _validar_min_nonempty(payload["direccion"], "direccion")
-
         if "bairro" in payload and payload["bairro"] is not None:
             upd["bairro"] = _validar_min_nonempty(payload["bairro"], "bairro")
-
         if "gesta_actual" in payload and payload["gesta_actual"] is not None:
             upd["gesta_actual"] = _validar_gesta_actual(payload["gesta_actual"])
 
-        if "contacto_emergencia" in payload and payload["contacto_emergencia"] is not None:
-            ce = payload["contacto_emergencia"]
-            if ce is None:
-                upd["contacto_emergencia"] = None
-            elif isinstance(ce, dict):
-                ce_nombre = _validar_min_nonempty(ce.get("nombre"), "contacto_emergencia.nombre")
-                ce_tel    = _validar_telefono(ce.get("telefono"))
-                upd["contacto_emergencia"] = {"nombre": ce_nombre, "telefono": ce_tel}
-            else:
-                raise ValueError("contacto_emergencia debe ser objeto o null")
-
-        # Regeneración del código (opcional y controlada)
+        # Regeneración del código (opcional)
         if payload.get("regenerate_codigo"):
-            doc_actual = mongo.db.pacientes.find_one({"_id": oid})
+            doc_actual = mongo.db.paciente.find_one({"_id": oid})
             if not doc_actual:
                 return _fail("Paciente no encontrado", 404)
             nombre   = upd.get("nombre",   doc_actual.get("nombre"))
             apellido = upd.get("apellido", doc_actual.get("apellido"))
             fecha_nac_dt = upd.get("fecha_nac", doc_actual.get("fecha_nac"))
             if not isinstance(fecha_nac_dt, datetime):
-                raise ValueError("fecha_nac inválida para regenerar código")
+                return _fail("fecha_nac inválida para regenerar código", 422)
             sexo = (payload.get("sexo") or "F").upper()
             municipio_codigo = payload.get("municipio_codigo") or "800"
 
             control = 0
             while control <= 99:
                 codigo = _generar_codigo_expediente(nombre, apellido, fecha_nac_dt, sexo, municipio_codigo, control)
-                existe = mongo.db.pacientes.find_one({"codigo_expediente": codigo, "_id": {"$ne": oid}})
+                existe = mongo.db.paciente.find_one({"codigo_expediente": codigo, "_id": {"$ne": oid}})
                 if not existe:
                     upd["codigo_expediente"] = codigo
                     break
@@ -371,7 +313,7 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
             return _ok({"mensaje": "Nada para actualizar"}, 200)
 
         upd["updated_at"] = datetime.utcnow()
-        res = mongo.db.pacientes.update_one({"_id": oid}, {"$set": upd}, session=session)
+        res = mongo.db.paciente.update_one({"_id": oid}, {"$set": upd}, session=session)
         if res.matched_count == 0:
             return _fail("Paciente no encontrado", 404)
         return _ok({"mensaje": "Paciente actualizado"}, 200)
@@ -379,25 +321,20 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
     except ValueError as ve:
         return _fail(str(ve), 422)
     except Exception as e:
-        msg = str(e)
-        if "duplicate key" in msg.lower():
+        if "duplicate key" in str(e).lower():
             return _fail("Duplicado: identificacion o codigo_expediente ya existen", 409)
         return _fail("Error al actualizar paciente", 400)
 
-
 def eliminar_paciente_por_id(paciente_id: str, hard: bool = False, session=None):
-    """
-    Baja lógica por defecto (activo=False). Si hard=True elimina físicamente.
-    """
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         if hard:
-            res = mongo.db.pacientes.delete_one({"_id": oid}, session=session)
+            res = mongo.db.paciente.delete_one({"_id": oid}, session=session)
             if res.deleted_count == 0:
                 return _fail("Paciente no encontrado", 404)
             return _ok({"mensaje": "Paciente eliminado definitivamente"}, 200)
         else:
-            res = mongo.db.pacientes.update_one({"_id": oid}, {"$set": {"activo": False, "updated_at": datetime.utcnow()}}, session=session)
+            res = mongo.db.paciente.update_one({"_id": oid}, {"$set": {"activo": False, "updated_at": datetime.utcnow()}}, session=session)
             if res.matched_count == 0:
                 return _fail("Paciente no encontrado", 404)
             return _ok({"mensaje": "Paciente desactivado"}, 200)
@@ -406,11 +343,7 @@ def eliminar_paciente_por_id(paciente_id: str, hard: bool = False, session=None)
     except Exception:
         return _fail("Error al eliminar paciente", 400)
 
-
 def listar_pacientes(q: str | None = None, page: int = 1, per_page: int = 20, solo_activos: bool = True):
-    """
-    Listado simple con búsqueda por nombre/apellido/identificacion.
-    """
     try:
         page = max(int(page or 1), 1)
         per_page = max(min(int(per_page or 20), 100), 1)
@@ -428,131 +361,43 @@ def listar_pacientes(q: str | None = None, page: int = 1, per_page: int = 20, so
                 {"codigo_expediente": rx},
             ]
 
-        total = mongo.db.pacientes.count_documents(filtro)
-        cursor = mongo.db.pacientes.find(filtro).sort("created_at", -1).skip((page - 1) * per_page).limit(per_page)
+        total = mongo.db.paciente.count_documents(filtro)
+        cursor = (mongo.db.paciente.find(filtro)
+                  .sort("created_at", -1)
+                  .skip((page - 1) * per_page)
+                  .limit(per_page))
         items = [_serialize(d) for d in cursor]
         return _ok({"items": items, "page": page, "per_page": per_page, "total": total}, 200)
 
     except Exception:
         return _fail("Error al listar pacientes", 400)
 
-
-def obtener_paciente(paciente_id: str, identificacion_id: str | None = None):
+def obtener_paciente(paciente_id: str):
     """
-    GET agregado del paciente:
-    - Retorna los datos del paciente.
-    - Agrega, si están disponibles, los segmentos de otros servicios.
-      Si se pasa identificacion_id, intenta priorizar datos de ese episodio.
-      Si no, devuelve el MÁS RECIENTE por paciente.
+    Retorna el paciente y, si está disponible `service_historial`,
+    agrega sus historiales (lista) y marca la referencia `historial_id` del paciente.
     """
     try:
         oid = _to_oid(paciente_id, "paciente_id")
-        doc = mongo.db.pacientes.find_one({"_id": oid})
+        doc = mongo.db.paciente.find_one({"_id": oid})
         if not doc:
             return _fail("Paciente no encontrado", 404)
 
         out = _serialize(doc)
 
-        # Episodios (identificaciones) – opcional
-        out["episodios"] = None
-        if svc_ident and hasattr(svc_ident, "listar_identificaciones_por_paciente"):
+        # Agregado: historiales del paciente (si el servicio está disponible)
+        out["historiales"] = None
+        out["historial_actual"] = None
+        if svc_his and hasattr(svc_his, "listar_historiales"):
             try:
-                eps = svc_ident.listar_identificaciones_por_paciente(paciente_id)
-                # eps puede venir como (_ok(data), code)
-                if isinstance(eps, tuple) and isinstance(eps[0], dict) and eps[0].get("ok"):
-                    out["episodios"] = eps[0]["data"]
+                lr, lc = svc_his.listar_historiales(paciente_id=paciente_id, page=1, per_page=50)
+                if lc == 200 and lr.get("ok"):
+                    out["historiales"] = lr["data"]
+                    # más reciente (si el servicio ordena por created_at desc)
+                    items = (lr["data"] or {}).get("items", [])
+                    out["historial_actual"] = items[0] if items else None
             except Exception:
                 pass
-
-        # Helper para elegir por episodio o por paciente
-        def _get_segment(fn_by_paciente, fn_by_identificacion):
-            if identificacion_id and fn_by_identificacion:
-                try:
-                    return fn_by_identificacion(identificacion_id)
-                except Exception:
-                    return None
-            if fn_by_paciente:
-                try:
-                    return fn_by_paciente(paciente_id)
-                except Exception:
-                    return None
-            return None
-
-        # Antecedentes
-        out["antecedentes"] = None
-        if svc_ant and hasattr(svc_ant, "get_antencedentes_by_id_paciente"):
-            try:
-                res = svc_ant.get_antencedentes_by_id_paciente(paciente_id)
-                if isinstance(res, dict) and res.get("ok"):
-                    out["antecedentes"] = res["data"]
-                elif isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                    out["antecedentes"] = res[0]["data"]
-            except Exception:
-                pass
-
-        # Gestación actual
-        out["gestacion_actual"] = None
-        if svc_ga and hasattr(svc_ga, "get_gestacion_actual_by_id_paciente"):
-            res = _get_segment(svc_ga.get_gestacion_actual_by_id_paciente,
-                               getattr(svc_ga, "obtener_gestacion_actual_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["gestacion_actual"] = res[0]["data"]
-
-        # Parto / Aborto
-        out["parto_aborto"] = None
-        if svc_pa and hasattr(svc_pa, "get_parto_aborto_by_id_paciente"):
-            res = _get_segment(svc_pa.get_parto_aborto_by_id_paciente,
-                               getattr(svc_pa, "obtener_parto_aborto_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["parto_aborto"] = res[0]["data"]
-
-        # Patologías
-        out["patologias"] = None
-        if svc_pat and hasattr(svc_pat, "get_patologias_by_id_paciente"):
-            res = _get_segment(svc_pat.get_patologias_by_id_paciente,
-                               getattr(svc_pat, "obtener_patologias_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["patologias"] = res[0]["data"]
-
-        # Puerperio
-        out["puerperio"] = None
-        if svc_puer and hasattr(svc_puer, "get_puerperio_by_id_paciente"):
-            res = _get_segment(svc_puer.get_puerperio_by_id_paciente,
-                               getattr(svc_puer, "obtener_puerperio_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["puerperio"] = res[0]["data"]
-
-        # Recién Nacido
-        out["recien_nacido"] = None
-        if svc_rn and hasattr(svc_rn, "get_recien_nacido_by_id_paciente"):
-            res = _get_segment(svc_rn.get_recien_nacido_by_id_paciente,
-                               getattr(svc_rn, "obtener_recien_nacido_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["recien_nacido"] = res[0]["data"]
-
-        # Egreso Neonatal
-        out["egreso_neonatal"] = None
-        if svc_en and hasattr(svc_en, "get_egreso_neonatal_by_id_paciente"):
-            res = _get_segment(svc_en.get_egreso_neonatal_by_id_paciente,
-                               getattr(svc_en, "obtener_egreso_neonatal_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["egreso_neonatal"] = res[0]["data"]
-
-        # Egreso Materno
-        out["egreso_materno"] = None
-        if svc_em and hasattr(svc_em, "get_egreso_materno_by_id_paciente"):
-            res = _get_segment(svc_em.get_egreso_materno_by_id_paciente,
-                               getattr(svc_em, "obtener_egreso_materno_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["egreso_materno"] = res[0]["data"]
-
-        # Anticoncepción
-        out["anticoncepcion"] = None
-        if svc_antico and hasattr(svc_antico, "get_anticoncepcion_by_id_paciente"):
-            res = _get_segment(svc_antico.get_anticoncepcion_by_id_paciente,
-                               getattr(svc_antico, "obtener_anticoncepcion_por_identificacion", None))
-            if isinstance(res, tuple) and isinstance(res[0], dict) and res[0].get("ok"):
-                out["anticoncepcion"] = res[0]["data"]
 
         return _ok(out, 200)
 
@@ -560,3 +405,20 @@ def obtener_paciente(paciente_id: str, identificacion_id: str | None = None):
         return _fail(str(ve), 422)
     except Exception:
         return _fail("Error al obtener paciente", 400)
+    
+# service_paciente.py
+def buscar_paciente_por_codigo_expediente(codigo: str):
+    try:
+        if not isinstance(codigo, str):
+            return _fail("codigo_expediente debe ser string", 422)
+        codigo = codigo.strip().upper()
+        if not _RE_EXPED.match(codigo):
+            return _fail("codigo_expediente con formato inválido", 422)
+
+        doc = mongo.db.paciente.find_one({"codigo_expediente": codigo})
+        if not doc:
+            return _fail("No existe paciente con ese codigo_expediente", 404)
+        return _ok(_serialize(doc), 200)
+    except Exception:
+        return _fail("Error al buscar paciente por codigo_expediente", 400)
+

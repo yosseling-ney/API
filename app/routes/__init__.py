@@ -1,8 +1,11 @@
 # app/routes/__init__.py
 from app.controllers.paciente_controller import bp as pacientes_bp
+from app.controllers.historial_controller import bp as historiales_bp
 from app.routes.usuarios import usuarios_bp
 
+# Registrar rutas
 def register_routes(app):
     app.register_blueprint(pacientes_bp)
-    # Registrar rutas
     app.register_blueprint(usuarios_bp)
+    app.register_blueprint(historiales_bp)  
+

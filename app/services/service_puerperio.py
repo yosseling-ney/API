@@ -6,7 +6,6 @@ from app import mongo
 def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, code
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
-
 # ---------------- Constantes / Enums ----------------
 _INVOL_UTER = {"cont", "flac", "otra"}
 _SI_NO_NC   = {"si", "no", "n_c"}
@@ -16,13 +15,23 @@ _SIS_MIN, _SIS_MAX   = 50, 250      # mmHg
 _DIA_MIN, _DIA_MAX   = 30, 150      # mmHg
 _PUL_MIN, _PUL_MAX   = 30, 220      # lpm
 
-
 # ---------------- Utils ----------------
 def _to_oid(v, field):
     try:
         return ObjectId(v)
     except Exception:
         raise ValueError(f"{field} no es un ObjectId válido")
+
+def _ensure_indexes():
+    try:
+        mongo.db.puerperio.create_index("historial_id", name="ix_puer_historial")
+    except Exception:
+        pass
+    # compat
+    try:
+        mongo.db.puerperio.create_index("paciente_id", name="ix_puer_paciente")
+    except Exception:
+        pass
 
 def _require(payload: dict, fields: list[str], where: str = ""):
     faltan = [f for f in fields if f not in payload]
@@ -71,7 +80,8 @@ def _as_datetime(s, field):
 def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
+        "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # compat
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "puerperio_inmediato": [
@@ -89,7 +99,6 @@ def _serialize(doc: dict):
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }
-
 
 # ---------------- Builders ----------------
 def _build_registro_puerperio(r: dict) -> dict:
@@ -115,13 +124,16 @@ def _build_registro_puerperio(r: dict) -> dict:
         "loquios": str(r["loquios"]),
     }
 
-def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
+def _build_doc(historial_id: str, payload: dict, usuario_actual: dict | None):
     _require(payload, ["puerperio_inmediato", "antirrubeola_postparto", "gammaglobulina_anti_d"])
     if not isinstance(payload["puerperio_inmediato"], list):
         raise ValueError("puerperio_inmediato debe ser un arreglo de registros")
 
     return {
-        "paciente_id": _to_oid(paciente_id, "paciente_id"),
+        "historial_id": _to_oid(historial_id, "historial_id"),
+        # compat: permitir guardar paciente_id si viene
+        **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")}
+           if payload.get("paciente_id") else {}),
         **({"identificacion_id": _to_oid(payload["identificacion_id"], "identificacion_id")}
            if payload.get("identificacion_id") else {}),
         **({"usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id")}
@@ -133,17 +145,23 @@ def _build_doc(paciente_id: str, payload: dict, usuario_actual: dict | None):
         "updated_at": datetime.utcnow(),
     }
 
-
 # ---------------- Services ----------------
-def crear_puerperio(paciente_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
-    """Crea registro de puerperio inmediato (orquestado por paciente_id)."""
+def crear_puerperio(historial_id: str, payload: dict, session=None, usuario_actual: dict | None = None):
+    """Crea registro de puerperio inmediato (FK principal: historial_id)."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
-        if not paciente_id:
-            return _fail("paciente_id es requerido", 422)
+        if not historial_id:
+            return _fail("historial_id es requerido", 422)
 
-        doc = _build_doc(paciente_id, payload, usuario_actual)
+        _ensure_indexes()
+
+        # validar existencia del historial
+        h_oid = _to_oid(historial_id, "historial_id")
+        if not mongo.db.historiales.find_one({"_id": h_oid}):
+            return _fail("historial_id no encontrado en historiales", 404)
+
+        doc = _build_doc(historial_id, payload, usuario_actual)
         res = mongo.db.puerperio.insert_one(doc, session=session) if session else mongo.db.puerperio.insert_one(doc)
         return _ok({"id": str(res.inserted_id)}, 201)
 
@@ -151,7 +169,6 @@ def crear_puerperio(paciente_id: str, payload: dict, session=None, usuario_actua
         return _fail(str(ve), 422)
     except Exception as e:
         return _fail(f"Error al guardar puerperio: {str(e)}", 400)
-
 
 def obtener_puerperio_por_id(pue_id: str):
     try:
@@ -165,9 +182,22 @@ def obtener_puerperio_por_id(pue_id: str):
     except Exception:
         return _fail("Error al obtener", 400)
 
+def obtener_puerperio_por_historial(historial_id: str):
+    """Devuelve el registro más reciente por historial_id."""
+    try:
+        oid = _to_oid(historial_id, "historial_id")
+        doc = mongo.db.puerperio.find_one({"historial_id": oid}, sort=[("created_at", -1)])
+        if not doc:
+            return _fail("No se encontró puerperio para este historial", 404)
+        return _ok(_serialize(doc), 200)
+    except ValueError as ve:
+        return _fail(str(ve), 422)
+    except Exception:
+        return _fail("Error al obtener", 400)
 
+# -------- Compat por paciente_id (apoyo de migración) --------
 def get_puerperio_by_id_paciente(paciente_id: str):
-    """Devuelve el registro más reciente por paciente_id (para GET agregado)."""
+    """Devuelve el registro más reciente por paciente_id (compatibilidad)."""
     try:
         oid = _to_oid(paciente_id, "paciente_id")
         doc = mongo.db.puerperio.find_one({"paciente_id": oid}, sort=[("created_at", -1)])
@@ -179,9 +209,8 @@ def get_puerperio_by_id_paciente(paciente_id: str):
     except Exception:
         return _fail("Error al obtener", 400)
 
-
 def actualizar_puerperio_por_id(pue_id: str, payload: dict, session=None):
-    """Actualiza por _id. Valida y normaliza lo que venga en payload."""
+    """Actualiza por _id. Normaliza y valida lo que venga. Soporta mover entre historiales validando existencia."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
@@ -189,7 +218,14 @@ def actualizar_puerperio_por_id(pue_id: str, payload: dict, session=None):
         oid = _to_oid(pue_id, "pue_id")
         upd = {}
 
-        # Re-vínculos opcionales
+        # FK principal: historial_id (si viene, validar)
+        if "historial_id" in payload and payload["historial_id"] is not None:
+            h_oid = _to_oid(payload["historial_id"], "historial_id")
+            if not mongo.db.historiales.find_one({"_id": h_oid}):
+                return _fail("historial_id no encontrado en historiales", 404)
+            upd["historial_id"] = h_oid
+
+        # Re-vínculos opcionales (compat)
         if "paciente_id" in payload and payload["paciente_id"]:
             upd["paciente_id"] = _to_oid(payload["paciente_id"], "paciente_id")
         if "identificacion_id" in payload and payload["identificacion_id"]:
@@ -223,7 +259,6 @@ def actualizar_puerperio_por_id(pue_id: str, payload: dict, session=None):
         return _fail(str(ve), 422)
     except Exception:
         return _fail("Error al actualizar", 400)
-
 
 def eliminar_puerperio_por_id(pue_id: str, session=None):
     try:
