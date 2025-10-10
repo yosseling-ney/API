@@ -19,6 +19,28 @@ def _usuario_actual_from_request():
     return datos if datos and datos.get("usuario_id") else None
 
 
+@bp.get("/identificacion")
+def buscar_por_identificacion():
+    """Busca paciente por tipo/numero de identificación.
+    Frontend espera 200 si existe o 404 si no existe/identificación inválida.
+    """
+    tipo = (request.args.get("tipo_identificacion") or "").strip()
+    numero = (request.args.get("numero_identificacion") or "").strip()
+
+    if not tipo or not numero:
+        res, code = _fail("tipo_identificacion y numero_identificacion son requeridos", 422)
+        return jsonify(res), code
+
+    res, code = service_paciente.buscar_paciente_por_identificacion(tipo, numero)
+
+    # El UI sólo reacciona a 200 (existe) o 404 (no existe).
+    # Si el servicio valida como 422 (formato inválido), lo tratamos como no encontrado.
+    if code == 422:
+        return jsonify({"ok": False, "data": None, "error": "No existe paciente con esa identificacion"}), 404
+
+    return jsonify(res), code
+
+
 @bp.post("/create")
 def crear_paciente():
     """
@@ -153,4 +175,60 @@ def obtener_paciente(paciente_id):
         },
         200,
     )
+    return jsonify(res), code
+
+
+@bp.put("/<paciente_id>")
+@bp.patch("/<paciente_id>")
+def actualizar_paciente(paciente_id):
+    """
+    Actualiza un paciente por id. Acepta actualizaciones parciales (PATCH) o completas (PUT).
+    Requiere autenticación.
+    """
+    usuario_actual = _usuario_actual_from_request()
+    if not usuario_actual:
+        res, code = _fail("usuario no autenticado", 401)
+        return jsonify(res), code
+
+    body = request.get_json() or {}
+    if not isinstance(body, dict):
+        res, code = _fail("JSON inválido", 400)
+        return jsonify(res), code
+
+    res, code = service_paciente.actualizar_paciente_por_id(paciente_id, body)
+    return jsonify(res), code
+
+
+@bp.put("/update")
+@bp.patch("/update")
+def actualizar_paciente_legacy():
+    """
+    Ruta legacy para actualizaciones cuando no se usa el path con id.
+    Espera `paciente_id` en body o query y el resto de campos a actualizar en el body.
+    """
+    usuario_actual = _usuario_actual_from_request()
+    if not usuario_actual:
+        res, code = _fail("usuario no autenticado", 401)
+        return jsonify(res), code
+
+    data = request.get_json() or {}
+    if not isinstance(data, dict):
+        res, code = _fail("JSON inválido", 400)
+        return jsonify(res), code
+
+    paciente_id = data.get("paciente_id") or request.args.get("paciente_id")
+    if not paciente_id:
+        res, code = _fail("paciente_id es requerido", 422)
+        return jsonify(res), code
+
+    # Si viene un objeto `payload`, úsalo; si no, usa el body sin paciente_id
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {
+        k: v for k, v in data.items() if k != "paciente_id"
+    }
+
+    if not isinstance(payload, dict):
+        res, code = _fail("payload inválido", 400)
+        return jsonify(res), code
+
+    res, code = service_paciente.actualizar_paciente_por_id(paciente_id, payload)
     return jsonify(res), code

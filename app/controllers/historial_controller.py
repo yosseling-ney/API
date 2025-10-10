@@ -118,6 +118,14 @@ def crear_historial():
                         raise RuntimeError(res.get("error") or f"Error creando {nombre_bloque}")
                     resumen["secciones_creadas"][f"{nombre_bloque}_id"] = res["data"].get("id")
 
+                    # Vincular campo *_id en el documento de historial
+                    ref_field = f"{nombre_bloque}_id"
+                    vinc_res, vinc_code = service_historial.vincular_segmento(
+                        historial_id, ref_field, res["data"].get("id"), session=s
+                    )
+                    if vinc_code not in (200, 201) or not vinc_res.get("ok"):
+                        raise RuntimeError(vinc_res.get("error") or f"Error vinculando {ref_field}")
+
                 # 2) Crear secciones si vienen
                 _crear("identificacion",  service_identificacion,   "crear_identificacion")
                 _crear("antecedentes",    service_antencedentes,    "crear_antecedentes")
@@ -169,6 +177,59 @@ def obtener_historial(historial_id):
     agregado = {"historial": hist_res["data"]}
 
     # Helper para obtener secciones por historial (usa el primer método disponible)
+    def _obtener(servicio, candidatos):
+        for fn in candidatos:
+            if hasattr(servicio, fn):
+                try:
+                    r, c = getattr(servicio, fn)(historial_id)
+                    if c in (200, 201) and r.get("ok"):
+                        return r["data"]
+                except Exception:
+                    pass
+        return None
+
+    agregado["identificacion"]  = _obtener(service_identificacion,  ("obtener_identificacion_por_historial",  "get_identificacion_by_historial_id"))
+    agregado["antecedentes"]    = _obtener(service_antencedentes,   ("obtener_antecedentes_por_historial",    "get_antecedentes_by_historial_id"))
+    agregado["gestacion_actual"]= _obtener(service_gestacion_actual,("obtener_gestacion_actual_por_historial","get_gestacion_actual_by_historial_id"))
+    agregado["parto_aborto"]    = _obtener(service_parto_aborto,    ("obtener_parto_aborto_por_historial",    "get_parto_aborto_by_historial_id"))
+    agregado["patologias"]      = _obtener(service_patologias,      ("obtener_patologias_por_historial",      "get_patologias_by_historial_id"))
+    agregado["recien_nacido"]   = _obtener(service_recien_nacido,   ("obtener_recien_nacido_por_historial",   "get_recien_nacido_by_historial_id"))
+    agregado["puerperio"]       = _obtener(service_puerperio,       ("obtener_puerperio_por_historial",       "get_puerperio_by_historial_id"))
+    agregado["egreso_neonatal"] = _obtener(service_egreso_neonatal, ("obtener_egreso_neonatal_por_historial", "get_egreso_neonatal_by_historial_id"))
+    agregado["egreso_materno"]  = _obtener(service_egreso_materno,  ("obtener_egreso_materno_por_historial",  "get_egreso_materno_by_historial_id"))
+    agregado["anticoncepcion"]  = _obtener(service_anticoncepcion,  ("obtener_anticoncepcion_por_historial",  "get_anticoncepcion_by_historial_id"))
+
+    res, code = _ok(agregado, 200)
+    return jsonify(res), code
+
+
+@bp.get("/por-paciente/<paciente_id>")
+def obtener_historial_por_paciente(paciente_id):
+    """
+    Devuelve el agregado del historial más reciente para un paciente dado.
+    Si no existe historial previo, responde 404.
+    """
+    # Buscar el historial más reciente del paciente
+    hist_list_res, hist_list_code = service_historial.listar_historiales(
+        paciente_id=paciente_id, page=1, per_page=1
+    )
+    if hist_list_code not in (200, 201) or not hist_list_res.get("ok"):
+        return jsonify(hist_list_res), hist_list_code
+
+    items = (hist_list_res["data"] or {}).get("items", [])
+    if not items:
+        res, code = _fail("Historial no encontrado para paciente", 404)
+        return jsonify(res), code
+
+    historial_id = items[0].get("id")
+
+    # Reutilizar la lógica de agregado por historial_id
+    hist_res, hist_code = service_historial.obtener_historial(historial_id)
+    if hist_code not in (200, 201) or not hist_res.get("ok"):
+        return jsonify(hist_res), hist_code
+
+    agregado = {"historial": hist_res["data"]}
+
     def _obtener(servicio, candidatos):
         for fn in candidatos:
             if hasattr(servicio, fn):

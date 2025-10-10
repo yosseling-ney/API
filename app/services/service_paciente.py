@@ -15,7 +15,13 @@ def _ok(data, code=200):   return {"ok": True, "data": data, "error": None}, cod
 def _fail(msg, code=400):  return {"ok": False, "data": None, "error": msg}, code
 
 # ---------------- Reglas / patrones ----------------
-_RE_CEDULA = re.compile(r"^\d{3}-\d{6}-\d{4}[A-Z]{1}$")
+_TIPOS_IDENTIFICACION = {"CI", "PSP", "NSS", "LC"}
+_RE_IDENTIFICACION_POR_TIPO = {
+    "CI": re.compile(r"^\d{3}-\d{6}-\d{4}[A-Z]{1}$"),
+    "PSP": re.compile(r"^[A-Z][0-9]{8}$"),
+    "NSS": re.compile(r"^[0-9]{8}$"),
+    "LC": re.compile(r"^[A-Z][0-9]{7}$"),
+}
 _RE_EXPED  = re.compile(r"^\d{3}[A-Z9]{4}[MF]\d{6}\d{2}$")
 _RE_TEL    = re.compile(r"^[0-9\+\-\s]{8,15}$")
 _ARTICULOS = {"DE", "DEL", "LA", "LOS", "LAS", "DA", "DO", "DOS", "DAS"}
@@ -42,7 +48,7 @@ def _norm_upper(s):
 
 def _ensure_indexes():
     try:
-        mongo.db.paciente.create_index("identificacion", unique=True, name="uq_identificacion")
+        mongo.db.paciente.create_index([("tipo_identificacion", 1), ("numero_identificacion", 1)], unique=True, name="uq_tipo_num_identificacion")
     except Exception:
         pass
     try:
@@ -54,13 +60,64 @@ def _ensure_indexes():
     except Exception:
         pass
 
-def _validar_cedula(c):
-    if not isinstance(c, str):
-        raise ValueError("identificacion debe ser string")
-    c = _norm_upper(c)
-    if not _RE_CEDULA.match(c):
-        raise ValueError("identificacion con formato inválido (###-######-####X)")
-    return c
+
+def _validar_tipo_identificacion(tipo):
+    if not isinstance(tipo, str):
+        raise ValueError("tipo_identificacion es requerido")
+    tipo_limpio = tipo.strip().upper()
+    if tipo_limpio not in _TIPOS_IDENTIFICACION:
+        raise ValueError("tipo_identificacion inválido")
+    return tipo_limpio
+
+
+def _validar_numero_identificacion(tipo: str, numero: str):
+    """
+    Normaliza y valida el número de identificación según el tipo.
+    - Reemplaza guiones raros (– — −) por "-", quita espacios y convierte a MAYÚSCULAS.
+    - Para CI:
+        * Si ya está en canónico ###-######-####A y es válido, lo devuelve.
+        * Si viene compacto, elimina separadores y valida (\d{3})(\d{6})(\d{4})([A-Z]);
+          si es válido, devuelve canónico 000-000000-0000X.
+        * Si no, 422 (ValueError).
+    - Para PSP/NSS/LC:
+        * Elimina todo lo no alfanumérico y valida contra su regex (sin separadores).
+        * Devuelve el valor limpio (sin separadores).
+    """
+    if tipo not in _TIPOS_IDENTIFICACION:
+        raise ValueError("tipo_identificacion inválido")
+    if not isinstance(numero, str):
+        raise ValueError("numero_identificacion debe ser string")
+
+    # Normalización básica (espacios extremos, mayúsculas, guiones raros -> "-")
+    numero_limpio = (numero.strip()
+                           .upper()
+                           .replace("–", "-")
+                           .replace("—", "-")
+                           .replace("−", "-"))
+
+    if tipo == "CI":
+        # 1) Si ya está en canónico, validar y devolver igual
+        if _RE_IDENTIFICACION_POR_TIPO["CI"].fullmatch(numero_limpio):
+            return numero_limpio
+
+        # 2) Quitar todo lo no alfanumérico y validar compacto
+        solo = re.sub(r"[^0-9A-Z]", "", numero_limpio)
+        m = re.fullmatch(r"(\d{3})(\d{6})(\d{4})([A-Z])", solo)
+        if m:
+            return f"{m[1]}-{m[2]}-{m[3]}{m[4]}"
+
+        # 3) No pasó ninguna forma válida
+        raise ValueError("numero_identificacion inválido para tipo CI")
+
+    # Para otros tipos (PSP, NSS, LC): quitar todo lo no alfanumérico y validar sin separadores
+    normal = re.sub(r"[^0-9A-Z]", "", numero_limpio)
+
+    patron = _RE_IDENTIFICACION_POR_TIPO.get(tipo)
+    if not patron or not patron.fullmatch(normal):
+        raise ValueError(f"numero_identificacion inválido para tipo {tipo}")
+
+    return normal
+
 
 def _validar_telefono(t):
     if not isinstance(t, str):
@@ -126,7 +183,8 @@ def _serialize(doc: dict):
         "historial_id": str(doc.get("historial_id")) if isinstance(doc.get("historial_id"), ObjectId) else (doc.get("historial_id") or None),
         "nombre": doc.get("nombre"),
         "apellido": doc.get("apellido"),
-        "identificacion": doc.get("identificacion"),
+        "tipo_identificacion": doc.get("tipo_identificacion"),
+        "numero_identificacion": doc.get("numero_identificacion"),
         "codigo_expediente": doc.get("codigo_expediente"),
         "fecha_nac": doc["fecha_nac"].strftime("%Y-%m-%d") if isinstance(doc.get("fecha_nac"), datetime) else None,
         "telefono": doc.get("telefono"),
@@ -140,17 +198,23 @@ def _serialize(doc: dict):
     }
 
 # ---------------- Services ----------------
-def buscar_paciente_por_cedula(identificacion: str):
+def buscar_paciente_por_identificacion(tipo_identificacion: str, numero_identificacion: str):
     try:
-        ident = _validar_cedula(identificacion)
-        doc = mongo.db.paciente.find_one({"identificacion": ident})
+        tipo = _validar_tipo_identificacion(tipo_identificacion)
+        numero = _validar_numero_identificacion(tipo, numero_identificacion)
+        doc = mongo.db.paciente.find_one({"tipo_identificacion": tipo, "numero_identificacion": numero})
         if not doc:
-            return _fail("No existe paciente con esa identificación", 404)
+            return _fail("No existe paciente con esa identificacion", 404)
         return _ok(_serialize(doc), 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
     except Exception:
         return _fail("Error al buscar paciente", 400)
+
+
+def buscar_paciente_por_cedula(identificacion: str):
+    return buscar_paciente_por_identificacion('CI', identificacion)
+
 
 def crear_paciente(payload: dict, session=None):
     """
@@ -166,7 +230,8 @@ def crear_paciente(payload: dict, session=None):
 
         nombre   = _validar_min_nonempty(payload.get("nombre"), "nombre")
         apellido = _validar_min_nonempty(payload.get("apellido"), "apellido")
-        identificacion = _validar_cedula(payload.get("identificacion"))
+        tipo_identificacion = _validar_tipo_identificacion(payload.get("tipo_identificacion"))
+        numero_identificacion = _validar_numero_identificacion(tipo_identificacion, payload.get("numero_identificacion"))
         fecha_nac_dt   = _parse_date_ymd(payload.get("fecha_nac"), "fecha_nac")
         telefono = _validar_telefono(payload.get("telefono"))
         direccion = _validar_min_nonempty(payload.get("direccion"), "direccion")
@@ -174,7 +239,7 @@ def crear_paciente(payload: dict, session=None):
         gesta_actual = _validar_gesta_actual(payload.get("gesta_actual"))
 
         # ya existe?
-        ya = mongo.db.paciente.find_one({"identificacion": identificacion})
+        ya = mongo.db.paciente.find_one({"tipo_identificacion": tipo_identificacion, "numero_identificacion": numero_identificacion})
         if ya:
             return {"ok": False, "data": _serialize(ya), "error": "Paciente ya existe"}, 409
 
@@ -203,7 +268,8 @@ def crear_paciente(payload: dict, session=None):
         doc = {
             "nombre": nombre.strip(),
             "apellido": apellido.strip(),
-            "identificacion": identificacion,
+            "tipo_identificacion": tipo_identificacion,
+            "numero_identificacion": numero_identificacion,
             "codigo_expediente": codigo,
             "fecha_nac": fecha_nac_dt,
             "telefono": telefono,
@@ -242,13 +308,13 @@ def crear_paciente(payload: dict, session=None):
         except Exception:
             pass
         if "duplicate key" in msg.lower():
-            return _fail("Duplicado: identificacion o codigo_expediente ya existen", 409)
+            return _fail("Duplicado: tipo/numero de identificacion o codigo_expediente ya existen", 409)
         return _fail(f"Error al crear paciente: {msg}", 400)
 
 def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
     """
     Permite actualizar campos básicos y opcionalmente:
-      - setear `historial_id` (validando existencia),
+      - setear historial_id (validando existencia),
       - o limpiarlo pasando null/None.
     """
     try:
@@ -257,6 +323,13 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
 
         oid = _to_oid(paciente_id, "paciente_id")
         upd = {}
+        doc_actual = None
+
+        def _obtener_doc_actual():
+            nonlocal doc_actual
+            if doc_actual is None:
+                doc_actual = mongo.db.paciente.find_one({"_id": oid})
+            return doc_actual
 
         if "historial_id" in payload:
             h = payload.get("historial_id")
@@ -272,8 +345,44 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
             upd["nombre"] = _validar_min_nonempty(payload["nombre"], "nombre")
         if "apellido" in payload and payload["apellido"] is not None:
             upd["apellido"] = _validar_min_nonempty(payload["apellido"], "apellido")
-        if "identificacion" in payload and payload["identificacion"] is not None:
-            upd["identificacion"] = _validar_cedula(payload["identificacion"])
+
+        if any(k in payload for k in ("tipo_identificacion", "numero_identificacion")):
+            doc = _obtener_doc_actual()
+            if not doc:
+                return _fail("Paciente no encontrado", 404)
+    
+            tipo_actual = doc.get("tipo_identificacion")
+            numero_actual = doc.get("numero_identificacion")
+
+            if tipo_actual is None or numero_actual is None:
+                raise ValueError("Paciente sin datos de identificacion")
+
+            if "tipo_identificacion" in payload and payload["tipo_identificacion"] is not None:
+                tipo_validado = _validar_tipo_identificacion(payload["tipo_identificacion"])
+            elif "tipo_identificacion" in payload:
+                raise ValueError("tipo_identificacion es requerido")
+            else:
+                tipo_validado = _validar_tipo_identificacion(tipo_actual)
+
+            if "numero_identificacion" in payload and payload["numero_identificacion"] is not None:
+                numero_fuente = payload["numero_identificacion"]
+            elif "numero_identificacion" in payload:
+                raise ValueError("numero_identificacion es requerido")
+            else:
+                numero_fuente = numero_actual
+
+            numero_validado = _validar_numero_identificacion(tipo_validado, numero_fuente)
+            upd["tipo_identificacion"] = tipo_validado
+            upd["numero_identificacion"] = numero_validado
+
+            existe = mongo.db.paciente.find_one({
+                "tipo_identificacion": tipo_validado,
+                "numero_identificacion": numero_validado,
+                "_id": {"$ne": oid},
+            })
+            if existe:
+                return _fail("Duplicado: tipo/numero de identificacion ya existen", 409)
+
         if "fecha_nac" in payload and payload["fecha_nac"] is not None:
             upd["fecha_nac"] = _parse_date_ymd(payload["fecha_nac"], "fecha_nac")
         if "telefono" in payload and payload["telefono"] is not None:
@@ -285,12 +394,11 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
         if "gesta_actual" in payload and payload["gesta_actual"] is not None:
             upd["gesta_actual"] = _validar_gesta_actual(payload["gesta_actual"])
 
-        # Regeneración del código (opcional)
         if payload.get("regenerate_codigo"):
-            doc_actual = mongo.db.paciente.find_one({"_id": oid})
+            doc_actual = _obtener_doc_actual()
             if not doc_actual:
                 return _fail("Paciente no encontrado", 404)
-            nombre   = upd.get("nombre",   doc_actual.get("nombre"))
+            nombre = upd.get("nombre", doc_actual.get("nombre"))
             apellido = upd.get("apellido", doc_actual.get("apellido"))
             fecha_nac_dt = upd.get("fecha_nac", doc_actual.get("fecha_nac"))
             if not isinstance(fecha_nac_dt, datetime):
@@ -322,8 +430,9 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
         return _fail(str(ve), 422)
     except Exception as e:
         if "duplicate key" in str(e).lower():
-            return _fail("Duplicado: identificacion o codigo_expediente ya existen", 409)
+            return _fail("Duplicado: tipo/numero de identificacion o codigo_expediente ya existen", 409)
         return _fail("Error al actualizar paciente", 400)
+
 
 def eliminar_paciente_por_id(paciente_id: str, hard: bool = False, session=None):
     try:
@@ -357,7 +466,7 @@ def listar_pacientes(q: str | None = None, page: int = 1, per_page: int = 20, so
             filtro["$or"] = [
                 {"nombre": rx},
                 {"apellido": rx},
-                {"identificacion": rx},
+                {"numero_identificacion": rx},
                 {"codigo_expediente": rx},
             ]
 
@@ -421,4 +530,3 @@ def buscar_paciente_por_codigo_expediente(codigo: str):
         return _ok(_serialize(doc), 200)
     except Exception:
         return _fail("Error al buscar paciente por codigo_expediente", 400)
-
