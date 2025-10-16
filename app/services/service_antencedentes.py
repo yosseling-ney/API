@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime 
+from dateutil.relativedelta import relativedelta  # requiere python-dateutil
 from bson import ObjectId
 from app import mongo
 
@@ -11,8 +12,10 @@ _DIABETES_TIPO = {"ninguna", "tipo I", "tipo II", "gestacional"}
 _SI_NO = {"si", "no"}
 _FRACASO_METODO = {"no_usaba", "barrera", "diu", "hormonal", "emergencia", "natural"}
 
+# NUEVO: enum de tiempo desde el último embarazo
+_TIEMPO_INTERVALOS = {"< 1 año", "1 a < 2 años", "2 a < 5 años", ">= 5 años"}
+
 _REQUIRED_FIELDS = [
-    # ahora el FK principal es historial_id (se exige en la firma de crear)
     "antecedentes_familiares",
     "antecedentes_personales",
     "gesta_previa",
@@ -39,8 +42,10 @@ def _to_oid(v, field):
         raise ValueError(f"{field} no es un ObjectId válido")
 
 def _norm_enum(v, opts, field):
-    if isinstance(v, str) and (vv := v.strip()) in opts:
-        return vv
+    if isinstance(v, str):
+        vv = v.strip()
+        if vv in opts:
+            return vv
     raise ValueError(f"{field} inválido; use uno de: {', '.join(sorted(opts))}")
 
 def _as_nonneg_int(v, field):
@@ -83,20 +88,32 @@ def _require_fields(payload: dict):
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
 
-# ==============================================================================
-# Validación de Coherencia Obstétrica (Reglas de Negocio)
-# ==============================================================================
-def _validate_obstetric_coherence(data: dict):
+# NUEVO: helper para clasificar el intervalo desde FFUE a fecha de referencia
+def _clasificar_tiempo_desde_ultimo_embarazo(ffue: datetime, ref: datetime | None = None) -> str:
     """
-    Reglas:
-      - Si gesta_previa == 0 -> todos los resultados previos (incluye 'vaginales') deben ser 0.
-      - Identidad: partos == cesareas + vaginales.
-      - Limites: cesareas <= partos, vaginales <= partos.
-      - Si gesta_previa > 0: (partos + abortos + embarazo_ectopico) <= gesta_previa.
+    Devuelve uno de: < 1 año | 1 a < 2 años | 2 a < 5 años | >= 5 años
+    ref por defecto: ahora (UTC). Si luego tienes la FUR del embarazo actual, puedes cambiar 'ref'.
     """
-    gesta_previa = data.get("gesta_previa", -1)
+    if not ref:
+        ref = datetime.utcnow()
+    if ffue > ref:
+        # Si llega una fecha en el futuro por error, normalizamos a '< 1 año'
+        return "< 1 año"
+    delta = relativedelta(ref, ffue)
+    meses = delta.years * 12 + delta.months
+    if meses < 12:
+        return "< 1 año"
+    if 12 <= meses < 24:
+        return "1 a < 2 años"
+    if 24 <= meses < 60:
+        return "2 a < 5 años"
+    return ">= 5 años"
 
-    # Normalizamos ausencia a 0 para sumar sin fallar
+# ======================================================================
+# Validación de Coherencia Obstétrica (igual que tenías)
+# ======================================================================
+def _validate_obstetric_coherence(data: dict):
+    gesta_previa = data.get("gesta_previa", -1)
     partos    = int(data.get("partos", 0) or 0)
     cesareas  = int(data.get("cesareas", 0) or 0)
     vaginales = int(data.get("vaginales", 0) or 0)
@@ -116,17 +133,13 @@ def _validate_obstetric_coherence(data: dict):
                     f"Inconsistencia de datos: Si 'gesta_previa' es 0, '{campo}' debe ser 0."
                 )
 
-    # Identidad y límites entre partos, cesareas, vaginales
     if partos != cesareas + vaginales:
-        raise ValueError(
-            "Inconsistencia de datos: 'partos' debe ser igual a 'vaginales + cesareas'."
-        )
+        raise ValueError("Inconsistencia de datos: 'partos' debe ser igual a 'vaginales + cesareas'.")
     if cesareas > partos:
         raise ValueError("Inconsistencia de datos: 'cesareas' no puede superar 'partos'.")
     if vaginales > partos:
         raise ValueError("Inconsistencia de datos: 'vaginales' no puede superar 'partos'.")
 
-    # Coherencia simple con gesta_previa (> 0)
     if gesta_previa > 0:
         total_eventos = partos + abortos + ectopico
         if total_eventos > gesta_previa:
@@ -134,8 +147,7 @@ def _validate_obstetric_coherence(data: dict):
                 "Inconsistencia de datos: La suma de Partos, Abortos y Embarazos Ectópicos no puede superar la 'gesta_previa'."
             )
 
-# ==============================================================================
-    
+# ======================================================================
 def _ensure_indexes():
     try:
         mongo.db.antecedentes.create_index("historial_id", name="ix_antecedentes_historial_id")
@@ -150,7 +162,7 @@ def _serialize(doc: dict):
     return {
         "id": str(doc["_id"]),
         "historial_id": str(doc["historial_id"]) if doc.get("historial_id") else None,
-        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # apoyo/migración
+        "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
         "antecedentes_familiares": doc.get("antecedentes_familiares"),
@@ -158,7 +170,7 @@ def _serialize(doc: dict):
         "gesta_previa": doc.get("gesta_previa"),
         "partos": doc.get("partos"),
         "cesareas": doc.get("cesareas"),
-        "vaginales": doc.get("vaginales"),  # <-- NUEVO
+        "vaginales": doc.get("vaginales"),
         "abortos": doc.get("abortos"),
         "nacidos_vivos": doc.get("nacidos_vivos"),
         "nacidos_muertos": doc.get("nacidos_muertos"),
@@ -170,13 +182,15 @@ def _serialize(doc: dict):
             doc["fecha_fin_ultimo_embarazo"].strftime("%Y-%m-%d")
             if doc.get("fecha_fin_ultimo_embarazo") else None
         ),
+        # NUEVO:
+        "tiempo_desde_ultimo_embarazo": doc.get("tiempo_desde_ultimo_embarazo"),
         "embarazo_planeado": doc.get("embarazo_planeado"),
         "fracaso_metodo_anticonceptivo": doc.get("fracaso_metodo_anticonceptivo"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
     }
 
-# ---------------- Normalizadores de subdocumentos ----------------
+# ---------------- Normalizadores de subdocumentos (sin cambios salvo helpers) ----------------
 _FAM_REQ = {"tbc", "diabetes", "hipertension", "preeclampsia", "eclampsia", "otra_condicion_medica_grave"}
 _FAM_OPT = {"observaciones"}
 
@@ -218,12 +232,10 @@ def _norm_antecedentes_personales(obj: dict) -> dict:
     if extras:
         raise ValueError("antecedentes_personales: campos no permitidos: " + ", ".join(sorted(extras)))
     out = {k: _as_bool(obj[k], f"antecedentes_personales.{k}") for k in _PER_REQ}
-    # opcionales
     if "antecedente_gemelares" in obj and obj["antecedente_gemelares"] is not None:
         out["antecedente_gemelares"] = _as_bool(obj["antecedente_gemelares"], "antecedentes_personales.antecedente_gemelares")
     if "observaciones" in obj and obj["observaciones"] is not None:
         out["observaciones"] = _norm_str(obj["observaciones"], "antecedentes_personales.observaciones")
-    # diabetes_tipo
     diab = out.get("diabetes", False)
     if "diabetes_tipo" in obj and obj["diabetes_tipo"] is not None:
         dt = _norm_str(obj["diabetes_tipo"], "antecedentes_personales.diabetes_tipo")
@@ -231,32 +243,24 @@ def _norm_antecedentes_personales(obj: dict) -> dict:
             raise ValueError("antecedentes_personales.diabetes_tipo inválido")
         out["diabetes_tipo"] = dt
     else:
-        # si diabetes True y no se envía, error
         if diab:
             raise ValueError("Si antecedentes_personales.diabetes es true, debe indicar diabetes_tipo")
-        # si diabetes False y no se envía, podemos fijar 'ninguna'
         out["diabetes_tipo"] = "ninguna"
     return out
 
-# Compatibilidad con payloads antiguos: mapear campos viejos al nuevo esquema
 def _compat_map_legacy(payload: dict, for_update: bool = False) -> dict:
     if not isinstance(payload, dict):
         return payload
     out = dict(payload)
-
-    # antecedentes_familiares como string -> objeto con observaciones (y defaults en create)
     if "antecedentes_familiares" in out and not isinstance(out.get("antecedentes_familiares"), dict):
         obs = out.get("antecedentes_familiares")
         fam = {}
         if not for_update:
-            # completar con falsos por defecto en create
             for k in _FAM_REQ:
                 fam[k] = False
         if isinstance(obs, str) and obs.strip():
             fam["observaciones"] = obs.strip()
         out["antecedentes_familiares"] = fam if fam else {k: False for k in _FAM_REQ}
-
-    # antecedentes_personales como string -> objeto con observaciones
     if "antecedentes_personales" in out and not isinstance(out.get("antecedentes_personales"), dict):
         obs = out.get("antecedentes_personales")
         per = {}
@@ -265,7 +269,6 @@ def _compat_map_legacy(payload: dict, for_update: bool = False) -> dict:
                 per[k] = False
         if isinstance(obs, str) and obs.strip():
             per["observaciones"] = obs.strip()
-        # mapear top-level violencia/diabetes_tipo si vienen sueltos
         if "violencia" in out and out["violencia"] is not None:
             per["violencia"] = _as_bool(out["violencia"], "violencia")
             out.pop("violencia", None)
@@ -273,15 +276,12 @@ def _compat_map_legacy(payload: dict, for_update: bool = False) -> dict:
             per["diabetes_tipo"] = _norm_str(out["diabetes_tipo"], "diabetes_tipo")
             out.pop("diabetes_tipo", None)
         out["antecedentes_personales"] = per if per else {k: False for k in _PER_REQ}
-
-    # Si vienen violencia/diabetes_tipo top-level sin subdocumento, tratar de inyectarlos
     if "violencia" in out and isinstance(out.get("antecedentes_personales"), dict):
         out["antecedentes_personales"]["violencia"] = _as_bool(out["violencia"], "violencia")
         out.pop("violencia", None)
     if "diabetes_tipo" in out and isinstance(out.get("antecedentes_personales"), dict):
         out["antecedentes_personales"]["diabetes_tipo"] = _norm_str(out["diabetes_tipo"], "diabetes_tipo")
         out.pop("diabetes_tipo", None)
-
     return out
 
 def _norm_antecedentes_familiares_partial(obj: dict) -> dict:
@@ -324,32 +324,30 @@ def crear_antecedentes(
     session=None,
     usuario_actual: dict | None = None
 ):
-    """
-    Crea antecedentes ORIENTADO A HISTORIAL:
-    - historial_id (OBLIGATORIO, FK principal)
-    - paciente_id e identificacion_id: OPCIONALES (apoyo/migración)
-    """
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
         if not historial_id:
             return _fail("historial_id es requerido", 422)
 
-        # Compatibilidad con payloads legados
         payload = _compat_map_legacy(payload, for_update=False)
-
         _require_fields(payload)
         _ensure_indexes()
 
         historial_oid = _to_oid(historial_id, "historial_id")
-
-        # Validación suave: el historial debe existir
         if not mongo.db.historiales.find_one({"_id": historial_oid}):
             return _fail("historial_id no encontrado en historiales", 404)
 
-        # -------------------------------------------------------------------
-        # Paso 1: Normalizar y validar tipos de datos
-        # -------------------------------------------------------------------
+        fecha_ffue = _parse_date(payload["fecha_fin_ultimo_embarazo"], "fecha_fin_ultimo_embarazo")
+
+        # Si envían el tiempo categorizado, lo validamos; si no, lo calculamos.
+        if "tiempo_desde_ultimo_embarazo" in payload and payload["tiempo_desde_ultimo_embarazo"] is not None:
+            tiempo_cat = _norm_enum(
+                payload["tiempo_desde_ultimo_embarazo"], _TIEMPO_INTERVALOS, "tiempo_desde_ultimo_embarazo"
+            )
+        else:
+            tiempo_cat = _clasificar_tiempo_desde_ultimo_embarazo(fecha_ffue)
+
         normalized_data = {
             "historial_id": historial_oid,
             **({"paciente_id": _to_oid(payload["paciente_id"], "paciente_id")}
@@ -371,33 +369,26 @@ def crear_antecedentes(
             "hijos_vivos": _as_nonneg_int(payload["hijos_vivos"], "hijos_vivos"),
             "muertos_primera_semana": _as_nonneg_int(payload["muertos_primera_semana"], "muertos_primera_semana"),
             "muertos_despues_semana": _as_nonneg_int(payload["muertos_despues_semana"], "muertos_despues_semana"),
-            "fecha_fin_ultimo_embarazo": _parse_date(payload["fecha_fin_ultimo_embarazo"], "fecha_fin_ultimo_embarazo"),
+            "fecha_fin_ultimo_embarazo": fecha_ffue,
+            "tiempo_desde_ultimo_embarazo": tiempo_cat,  # NUEVO
             "embarazo_planeado": _norm_enum(payload["embarazo_planeado"], _SI_NO, "embarazo_planeado"),
             "fracaso_metodo_anticonceptivo": _norm_enum(
                 payload["fracaso_metodo_anticonceptivo"], _FRACASO_METODO, "fracaso_metodo_anticonceptivo"
             ),
         }
-        
-        # -------------------------------------------------------------------
-        # Paso 2: Validación de coherencia de negocio
-        # -------------------------------------------------------------------
+
         _validate_obstetric_coherence(normalized_data)
-        
-        # -------------------------------------------------------------------
-        # Paso 3: Completar metadata y guardar
-        # -------------------------------------------------------------------
+
         doc = {
             **normalized_data,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
-
         res = (mongo.db.antecedentes.insert_one(doc, session=session)
                if session else mongo.db.antecedentes.insert_one(doc))
         return _ok({"id": str(res.inserted_id)}, 201)
 
     except ValueError as ve:
-        # Se captura el error de validación de tipos o de coherencia
         return _fail(str(ve), 422)
     except Exception as e:
         return _fail(f"Error al guardar antecedentes: {str(e)}", 400)
@@ -415,7 +406,6 @@ def obtener_antecedentes_por_id(ant_id: str):
         return _fail("Error al obtener", 400)
 
 def obtener_antecedentes_por_historial(historial_id: str):
-    """Devuelve el registro más reciente por historial_id."""
     try:
         oid = _to_oid(historial_id, "historial_id")
         doc = mongo.db.antecedentes.find_one({"historial_id": oid}, sort=[("created_at", -1)])
@@ -427,7 +417,6 @@ def obtener_antecedentes_por_historial(historial_id: str):
     except Exception:
         return _fail("Error al obtener", 400)
 
-# ---- Soporte/migración (opcional): aún se puede consultar por paciente_id
 def get_antecedentes_by_id_paciente(paciente_id: str):
     try:
         oid = _to_oid(paciente_id, "paciente_id")
@@ -441,7 +430,6 @@ def get_antecedentes_by_id_paciente(paciente_id: str):
         return _fail("Error al obtener", 400)
 
 def obtener_antecedentes_por_identificacion(identificacion_id: str):
-    """Alternativa: obtener por identificacion_id (más reciente)."""
     try:
         oid = _to_oid(identificacion_id, "identificacion_id")
         doc = mongo.db.antecedentes.find_one({"identificacion_id": oid}, sort=[("created_at", -1)])
@@ -454,27 +442,20 @@ def obtener_antecedentes_por_identificacion(identificacion_id: str):
         return _fail("Error al obtener", 400)
 
 def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
-    """Actualiza por _id. Permite cambiar historial_id (validando existencia) y normaliza enums/bools/ints/fecha."""
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
 
         oid = _to_oid(ant_id, "ant_id")
-        # Compatibilidad con payloads legados
         payload = _compat_map_legacy(payload, for_update=True)
         upd = dict(payload)
-        
-        # -------------------------------------------------------------------
-        # Paso 1: Normalizar y validar tipos de datos
-        # -------------------------------------------------------------------
 
-        # Ids opcionales / FK principal puede cambiarse
+        # Ids / FK
         if "historial_id" in upd and upd["historial_id"] is not None:
             h_oid = _to_oid(upd["historial_id"], "historial_id")
             if not mongo.db.historiales.find_one({"_id": h_oid}):
                 return _fail("historial_id no encontrado en historiales", 404)
             upd["historial_id"] = h_oid
-
         if "identificacion_id" in upd and upd["identificacion_id"]:
             upd["identificacion_id"] = _to_oid(upd["identificacion_id"], "identificacion_id")
         if "paciente_id" in upd and upd["paciente_id"]:
@@ -491,6 +472,36 @@ def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
             upd["fracaso_metodo_anticonceptivo"] = _norm_enum(
                 upd["fracaso_metodo_anticonceptivo"], _FRACASO_METODO, "fracaso_metodo_anticonceptivo"
             )
+        # NUEVO: tiempo_desde_ultimo_embarazo
+        fecha_en_update = None
+        if "fecha_fin_ultimo_embarazo" in upd and upd["fecha_fin_ultimo_embarazo"]:
+            fecha_en_update = _parse_date(upd["fecha_fin_ultimo_embarazo"], "fecha_fin_ultimo_embarazo")
+            upd["fecha_fin_ultimo_embarazo"] = fecha_en_update
+
+        if "tiempo_desde_ultimo_embarazo" in upd and upd["tiempo_desde_ultimo_embarazo"] is not None:
+            # Permito el valor especial "__auto__" para forzar recálculo sin enviar enum
+            if isinstance(upd["tiempo_desde_ultimo_embarazo"], str) and upd["tiempo_desde_ultimo_embarazo"].strip() == "__auto__":
+                # si mandan "__auto__", calculo usando la fecha nueva (si vino) o la ya almacenada
+                current_doc_res = obtener_antecedentes_por_id(ant_id)
+                if not current_doc_res[0]["ok"]:
+                    return current_doc_res
+                current_doc = current_doc_res[0]["data"]
+                base_fecha = fecha_en_update or (
+                    datetime.strptime(current_doc["fecha_fin_ultimo_embarazo"], "%Y-%m-%d")
+                    if current_doc.get("fecha_fin_ultimo_embarazo") else None
+                )
+                if not base_fecha:
+                    return _fail("No se puede autocalcular tiempo_desde_ultimo_embarazo sin fecha_fin_ultimo_embarazo", 422)
+                upd["tiempo_desde_ultimo_embarazo"] = _clasificar_tiempo_desde_ultimo_embarazo(base_fecha)
+            else:
+                upd["tiempo_desde_ultimo_embarazo"] = _norm_enum(
+                    upd["tiempo_desde_ultimo_embarazo"], _TIEMPO_INTERVALOS, "tiempo_desde_ultimo_embarazo"
+                )
+        elif fecha_en_update is not None:
+            # Si actualizaron la fecha pero no mandaron el tiempo, NO lo tocamos automáticamente
+            # (evitamos cambios silenciosos). Si lo quieres automático siempre, descomenta:
+            # upd["tiempo_desde_ultimo_embarazo"] = _clasificar_tiempo_desde_ultimo_embarazo(fecha_en_update)
+            pass
 
         # Subdocumentos
         if "antecedentes_familiares" in upd and upd["antecedentes_familiares"] is not None:
@@ -498,7 +509,7 @@ def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
         if "antecedentes_personales" in upd and upd["antecedentes_personales"] is not None:
             upd["antecedentes_personales"] = _norm_antecedentes_personales_partial(upd["antecedentes_personales"])
 
-        # Ints (incluye vaginales)
+        # Ints
         for k in (
             "gesta_previa", "partos", "cesareas", "vaginales", "abortos",
             "nacidos_vivos", "nacidos_muertos", "embarazo_ectopico",
@@ -507,31 +518,26 @@ def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
             if k in upd and upd[k] is not None:
                 upd[k] = _as_nonneg_int(upd[k], k)
 
-        # Fecha
-        if "fecha_fin_ultimo_embarazo" in upd and upd["fecha_fin_ultimo_embarazo"]:
-            upd["fecha_fin_ultimo_embarazo"] = _parse_date(upd["fecha_fin_ultimo_embarazo"], "fecha_fin_ultimo_embarazo")
-        
-        # -------------------------------------------------------------------
-        # Paso 2: Ejecutar la validación de coherencia de negocio sobre el MERGE
-        # -------------------------------------------------------------------
-        # Traemos el documento actual para validar coherencia con campos no actualizados
+        # Validación de coherencia sobre el merge
         current_doc_res = obtener_antecedentes_por_id(ant_id)
         if not current_doc_res[0]["ok"]:
             return current_doc_res
-        current_doc = current_doc_res[0]["data"]  # serializado
-
-        # Construimos un dict mezclando: lo actual (serializado) + el update normalizado
+        current_doc = current_doc_res[0]["data"]
         merged = dict(current_doc)
-        merged.update(upd)
+        merged.update({
+            # homogeneizamos claves a como las usa la validación
+            **{k: v for k, v in upd.items()}
+        })
+        # Adaptar fecha serializada -> datetime para validar si fuera necesario
+        if isinstance(merged.get("fecha_fin_ultimo_embarazo"), str):
+            try:
+                merged["fecha_fin_ultimo_embarazo"] = datetime.strptime(merged["fecha_fin_ultimo_embarazo"], "%Y-%m-%d")
+            except Exception:
+                pass
 
-        # Validamos coherencia completa (usa reglas con 'vaginales')
         _validate_obstetric_coherence(merged)
 
-        # -------------------------------------------------------------------
-        # Paso 3: Completar metadata y actualizar
-        # -------------------------------------------------------------------
         upd["updated_at"] = datetime.utcnow()
-
         res = mongo.db.antecedentes.update_one({"_id": oid}, {"$set": upd}, session=session)
         if res.matched_count == 0:
             return _fail("No se encontró el documento", 404)
@@ -566,7 +572,6 @@ def eliminar_antecedentes_por_historial_id(historial_id: str, session=None):
     except Exception:
         return _fail("Error al eliminar", 400)
 
-# soporte previo si aún lo usas en limpiezas antiguas
 def eliminar_antecedentes_por_paciente_id(paciente_id: str, session=None):
     try:
         oid = _to_oid(paciente_id, "paciente_id")

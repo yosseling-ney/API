@@ -67,6 +67,11 @@ def init_indexes():
     _safe_create("recien_nacidos", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
                  name="historial_created_desc_idx")
 
+    # ---------------- mensajes ----------------
+    _safe_create("mensajes", [("paciente_id", ASCENDING), ("created_at", DESCENDING)],
+                 name="ix_mensajes_paciente_created")
+    _safe_create("mensajes", [("created_at", DESCENDING)], name="ix_mensajes_created")
+
     # ---------------- puerperio ----------------
     _safe_create("puerperio", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
                  name="historial_created_desc_idx")
