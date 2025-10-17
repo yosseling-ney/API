@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 SECRET_KEY = os.getenv('JWT_SECRET_KEY')
 
+
 def generar_token(usuario_id, rol):
     token = jwt.encode(
         {"usuario_id": usuario_id, "rol": rol},
@@ -14,6 +15,7 @@ def generar_token(usuario_id, rol):
         algorithm="HS256"
     )
     return token
+
 
 def verificar_token(token):
     try:
@@ -23,6 +25,7 @@ def verificar_token(token):
         return None
     except jwt.InvalidTokenError:
         return None
+
 
 def token_required(f):
     @wraps(f)
@@ -39,7 +42,11 @@ def token_required(f):
         if not datos:
             return jsonify({'error': 'Token inválido'}), 401
 
-        #  Pasamos el usuario_actual explícitamente
-        return f(datos, *args, **kwargs)
+        # Guardar el usuario actual en el contexto de la petición
+        g.usuario_actual = datos
+
+        # No alterar la firma de la función vista
+        return f(*args, **kwargs)
 
     return decorated
+
