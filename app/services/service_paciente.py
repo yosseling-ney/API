@@ -193,8 +193,9 @@ def _serialize(doc: dict):
         "gesta_actual": doc.get("gesta_actual"),
         "contacto_emergencia": doc.get("contacto_emergencia"),
         "activo": doc.get("activo", True),
-        "created_at": doc.get("created_at"),
-        "updated_at": doc.get("updated_at"),
+        # Asegurar serialización JSON (datetime -> ISO8601 string)
+        "created_at": (doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else doc.get("created_at")),
+        "updated_at": (doc.get("updated_at").isoformat() if isinstance(doc.get("updated_at"), datetime) else doc.get("updated_at")),
     }
 
 # ---------------- Services ----------------

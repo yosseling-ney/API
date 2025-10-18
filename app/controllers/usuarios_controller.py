@@ -3,13 +3,11 @@ from bson import ObjectId
 from app import mongo
 from app.models.usuario_model import serializar_usuario
 from app.utils.helpers import encriptar_password, verificar_password
-from app.utils.jwt_manager import generar_token
-from app.utils.jwt_manager import generar_token, token_required 
-
+from app.utils.jwt_manager import generar_token, token_required
 from app.utils.helpers import verificar_password
 
-@token_required 
-def obtener_usuarios():
+@token_required
+def obtener_usuarios(usuario_actual):
     usuarios = mongo.db.usuarios.find()
     resultado = [serializar_usuario(usuario) for usuario in usuarios]
     return jsonify(resultado)

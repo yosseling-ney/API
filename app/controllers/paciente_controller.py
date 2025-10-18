@@ -54,14 +54,19 @@ def crear_paciente():
 
     body = request.get_json() or {}
 
-    required_blocks = ["datos_generales"]
-    faltan = [k for k in required_blocks if k not in body]
-    if faltan:
-        res, code = _fail(f"Faltan bloques: {', '.join(faltan)}", 422)
-        return jsonify(res), code
-
-    datos_generales = body["datos_generales"]
-    hist_data = body.get("historial")
+    # Aceptar dos formatos:
+    # 1) { "datos_generales": { ... }, "historial": {...?} }
+    # 2) payload plano con los campos del paciente (y opcionalmente "historial")
+    if isinstance(body.get("datos_generales"), dict):
+        datos_generales = body["datos_generales"]
+        hist_data = body.get("historial")
+    else:
+        # fallback: tratar el body como datos_generales, excluyendo la clave 'historial'
+        datos_generales = {k: v for k, v in body.items() if k != "historial"}
+        hist_data = body.get("historial")
+        if not datos_generales:
+            res, code = _fail("Faltan bloques: datos_generales", 422)
+            return jsonify(res), code
 
     resumen = {"paciente_id": None, "historial_id": None}
     paciente_id = None
