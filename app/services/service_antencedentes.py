@@ -1,5 +1,5 @@
 from datetime import datetime 
-from dateutil.relativedelta import relativedelta  # requiere python-dateutil
+from dateutil.relativedelta import relativedelta 
 from bson import ObjectId
 from app import mongo
 
@@ -12,8 +12,16 @@ _DIABETES_TIPO = {"ninguna", "tipo I", "tipo II", "gestacional"}
 _SI_NO = {"si", "no"}
 _FRACASO_METODO = {"no_usaba", "barrera", "diu", "hormonal", "emergencia", "natural"}
 
-# NUEVO: enum de tiempo desde el último embarazo
+#  enum de tiempo desde el último embarazo
 _TIEMPO_INTERVALOS = {"< 1 año", "1 a < 2 años", "2 a < 5 años", ">= 5 años"}
+
+#  enum de peso del RN del último embarazo (según tu JSON Schema)
+_PESO_ULTIMO_PREVIO_ENUM = {
+    "menor a 2500g",
+    "entre 2500g y 4000g",
+    "mayor a 4000g",
+    "no aplica/sin dato",
+}
 
 _REQUIRED_FIELDS = [
     "antecedentes_familiares",
@@ -88,7 +96,7 @@ def _require_fields(payload: dict):
     if faltan:
         raise ValueError("Campos requeridos faltantes: " + ", ".join(faltan))
 
-# NUEVO: helper para clasificar el intervalo desde FFUE a fecha de referencia
+#  helper para clasificar el intervalo desde FFUE a fecha de referencia
 def _clasificar_tiempo_desde_ultimo_embarazo(ffue: datetime, ref: datetime | None = None) -> str:
     """
     Devuelve uno de: < 1 año | 1 a < 2 años | 2 a < 5 años | >= 5 años
@@ -109,9 +117,93 @@ def _clasificar_tiempo_desde_ultimo_embarazo(ffue: datetime, ref: datetime | Non
         return "2 a < 5 años"
     return ">= 5 años"
 
-# ======================================================================
-# Validación de Coherencia Obstétrica (igual que tenías)
-# ======================================================================
+# mapping de etiquetas legacy del front a enum del schema
+def _map_peso_client_to_schema(v: str | None) -> str | None:
+    if v is None:
+        return None
+    vv = str(v).strip()
+    mapping = {
+        "< 2500g": "menor a 2500g",
+        "normal/n/c": "entre 2500g y 4000g",
+        "> 4000g": "mayor a 4000g",
+        "no_aplica": "no aplica/sin dato",
+    }
+    # Si ya viene en formato schema, respétalo
+    if vv in _PESO_ULTIMO_PREVIO_ENUM:
+        return vv
+    return mapping.get(vv)
+
+# Compatibilidad: mapeo de claves "legacy" del payload a las actuales
+def _compat_map_legacy(payload: dict, for_update: bool = False) -> dict:
+    """
+    Mapea posibles nombres de campos legacy a los usados por el servicio.
+    Es conservador: si no encuentra sinónimos, devuelve el payload tal cual.
+
+    Ejemplos mapeados:
+      - fecha_ultimo_embarazo, ffue -> fecha_fin_ultimo_embarazo
+      - fracaso_metodo -> fracaso_metodo_anticonceptivo
+      - tiempo_ultimo_embarazo -> tiempo_desde_ultimo_embarazo
+      - familiares/personales -> antecedentes_familiares/antecedentes_personales
+      - gemelares -> antecedente_gemelares (dentro de antecedentes_personales)
+      - booleano en embarazo_planeado True/False -> "si"/"no"
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    out = dict(payload)
+
+    # ---- Raíz: sinónimos de campos
+    if "fecha_fin_ultimo_embarazo" not in out:
+        for k in ("fecha_ultimo_embarazo", "ffue", "fecha_fin_ult_embarazo"):
+            if k in out and out[k]:
+                out["fecha_fin_ultimo_embarazo"] = out.pop(k)
+                break
+
+    if "fracaso_metodo_anticonceptivo" not in out and "fracaso_metodo" in out:
+        out["fracaso_metodo_anticonceptivo"] = out.pop("fracaso_metodo")
+
+    if "tiempo_desde_ultimo_embarazo" not in out and "tiempo_ultimo_embarazo" in out:
+        out["tiempo_desde_ultimo_embarazo"] = out.pop("tiempo_ultimo_embarazo")
+
+    # En algunos payloads antiguos venían como "familiares"/"personales"
+    if "antecedentes_familiares" not in out and isinstance(out.get("familiares"), dict):
+        out["antecedentes_familiares"] = out.pop("familiares")
+    if "antecedentes_personales" not in out and isinstance(out.get("personales"), dict):
+        out["antecedentes_personales"] = out.pop("personales")
+
+    # Normalizar embarazo_planeado si vino como booleano
+    if "embarazo_planeado" in out and isinstance(out["embarazo_planeado"], bool):
+        out["embarazo_planeado"] = "si" if out["embarazo_planeado"] else "no"
+
+    # Ids alternativos
+    if "paciente_id" not in out and out.get("paciente"):
+        out["paciente_id"] = out.pop("paciente")
+    if "identificacion_id" not in out and out.get("identificacion"):
+        out["identificacion_id"] = out.pop("identificacion")
+    if "usuario_id" not in out and out.get("usuario"):
+        out["usuario_id"] = out.pop("usuario")
+
+    # ---- Subdocumento: antecedentes_personales
+    ap = out.get("antecedentes_personales")
+    if isinstance(ap, dict):
+        if "antecedente_gemelares" not in ap and "gemelares" in ap:
+            ap["antecedente_gemelares"] = ap.pop("gemelares")
+        # Aceptar sinónimo tipo_diabetes -> diabetes_tipo
+        if "diabetes_tipo" not in ap and ap.get("tipo_diabetes"):
+            ap["diabetes_tipo"] = ap.pop("tipo_diabetes")
+        # Aceptar peso_ultimo_previo legacy como ya manejado por _map_peso_client_to_schema más adelante
+        # No transformamos aquí valores; solo dejamos el campo si vino con otro nombre
+        if "peso_ultimo_previo" not in ap and ap.get("peso_rn_ultimo_embarazo") is not None:
+            ap["peso_ultimo_previo"] = ap.pop("peso_rn_ultimo_embarazo")
+
+    # Para crear, si faltan bloques, inicializar diccionarios vacíos
+    if not for_update:
+        out.setdefault("antecedentes_familiares", {})
+        out.setdefault("antecedentes_personales", {})
+
+    return out
+
+# Validación de Coherencia Obstétrica 
 def _validate_obstetric_coherence(data: dict):
     gesta_previa = data.get("gesta_previa", -1)
     partos    = int(data.get("partos", 0) or 0)
@@ -190,7 +282,7 @@ def _serialize(doc: dict):
         "updated_at": doc.get("updated_at"),
     }
 
-# ---------------- Normalizadores de subdocumentos (sin cambios salvo helpers) ----------------
+# ---------------- Normalizadores de subdocumentos ----------------
 _FAM_REQ = {"tbc", "diabetes", "hipertension", "preeclampsia", "eclampsia", "otra_condicion_medica_grave"}
 _FAM_OPT = {"observaciones"}
 
@@ -199,7 +291,12 @@ _PER_REQ = {
     "otra_condicion_medica_grave", "violencia", "vih", "cirugia_genito_urinaria",
     "infertilidad", "cardiopatia", "nefropatia"
 }
-_PER_OPT = {"antecedente_gemelares", "observaciones", "diabetes_tipo"}
+#  agregar peso_ultimo_previo como opcional
+_PER_OPT = {"antecedente_gemelares", "observaciones", "diabetes_tipo", "peso_ultimo_previo"}
+
+#  defaults para completar faltantes al CREAR
+_FAM_DEFAULTS = {k: False for k in _FAM_REQ}
+_PER_DEFAULTS = {k: False for k in _PER_REQ}
 
 def _norm_str(v, field):
     if v is None:
@@ -208,34 +305,44 @@ def _norm_str(v, field):
         raise ValueError(f"{field} debe ser string")
     return v.strip()
 
+#  normalizador RELAJADO para crear (completa faltantes con False)
 def _norm_antecedentes_familiares(obj: dict) -> dict:
     if not isinstance(obj, dict):
-        raise ValueError("antecedentes_familiares debe ser objeto")
-    faltan = [k for k in _FAM_REQ if k not in obj]
-    if faltan:
-        raise ValueError("antecedentes_familiares: faltan campos requeridos: " + ", ".join(sorted(faltan)))
-    extras = set(obj.keys()) - (_FAM_REQ | _FAM_OPT)
-    if extras:
-        raise ValueError("antecedentes_familiares: campos no permitidos: " + ", ".join(sorted(extras)))
-    out = {k: _as_bool(obj[k], f"antecedentes_familiares.{k}") for k in _FAM_REQ}
+        # si no mandan objeto, inicializamos a todos False
+        obj = {}
+    out = dict(_FAM_DEFAULTS)  # completa todo a False
+    # pisa con lo que venga en el payload (validando tipos si vienen)
+    for k in _FAM_REQ:
+        if k in obj and obj[k] is not None:
+            out[k] = _as_bool(obj[k], f"antecedentes_familiares.{k}")
     if "observaciones" in obj and obj["observaciones"] is not None:
         out["observaciones"] = _norm_str(obj["observaciones"], "antecedentes_familiares.observaciones")
     return out
 
+#  normalizador RELAJADO para crear (completa faltantes con False)
 def _norm_antecedentes_personales(obj: dict) -> dict:
     if not isinstance(obj, dict):
-        raise ValueError("antecedentes_personales debe ser objeto")
-    faltan = [k for k in _PER_REQ if k not in obj]
-    if faltan:
-        raise ValueError("antecedentes_personales: faltan campos requeridos: " + ", ".join(sorted(faltan)))
-    extras = set(obj.keys()) - (_PER_REQ | _PER_OPT)
-    if extras:
-        raise ValueError("antecedentes_personales: campos no permitidos: " + ", ".join(sorted(extras)))
-    out = {k: _as_bool(obj[k], f"antecedentes_personales.{k}") for k in _PER_REQ}
+        obj = {}
+    out = dict(_PER_DEFAULTS)
+    for k in _PER_REQ:
+        if k in obj and obj[k] is not None:
+            out[k] = _as_bool(obj[k], f"antecedentes_personales.{k}")
+
+    # opcionales
     if "antecedente_gemelares" in obj and obj["antecedente_gemelares"] is not None:
         out["antecedente_gemelares"] = _as_bool(obj["antecedente_gemelares"], "antecedentes_personales.antecedente_gemelares")
     if "observaciones" in obj and obj["observaciones"] is not None:
         out["observaciones"] = _norm_str(obj["observaciones"], "antecedentes_personales.observaciones")
+
+    # peso_ultimo_previo (acepta legacy y enum)
+    if "peso_ultimo_previo" in obj and obj["peso_ultimo_previo"] is not None:
+        p = _norm_str(obj["peso_ultimo_previo"], "antecedentes_personales.peso_ultimo_previo")
+        mapped = _map_peso_client_to_schema(p)
+        if mapped is None or mapped not in _PESO_ULTIMO_PREVIO_ENUM:
+            raise ValueError("antecedentes_personales.peso_ultimo_previo inválido")
+        out["peso_ultimo_previo"] = mapped
+
+    # diabetes_tipo
     diab = out.get("diabetes", False)
     if "diabetes_tipo" in obj and obj["diabetes_tipo"] is not None:
         dt = _norm_str(obj["diabetes_tipo"], "antecedentes_personales.diabetes_tipo")
@@ -243,47 +350,15 @@ def _norm_antecedentes_personales(obj: dict) -> dict:
             raise ValueError("antecedentes_personales.diabetes_tipo inválido")
         out["diabetes_tipo"] = dt
     else:
+        # si no mandan diabetes_tipo:
+        out["diabetes_tipo"] = "ninguna" if not diab else "ninguna"  # por defecto
         if diab:
+            # si diabetes es True y no vino tipo, exige tipo explícito
             raise ValueError("Si antecedentes_personales.diabetes es true, debe indicar diabetes_tipo")
-        out["diabetes_tipo"] = "ninguna"
+
     return out
 
-def _compat_map_legacy(payload: dict, for_update: bool = False) -> dict:
-    if not isinstance(payload, dict):
-        return payload
-    out = dict(payload)
-    if "antecedentes_familiares" in out and not isinstance(out.get("antecedentes_familiares"), dict):
-        obs = out.get("antecedentes_familiares")
-        fam = {}
-        if not for_update:
-            for k in _FAM_REQ:
-                fam[k] = False
-        if isinstance(obs, str) and obs.strip():
-            fam["observaciones"] = obs.strip()
-        out["antecedentes_familiares"] = fam if fam else {k: False for k in _FAM_REQ}
-    if "antecedentes_personales" in out and not isinstance(out.get("antecedentes_personales"), dict):
-        obs = out.get("antecedentes_personales")
-        per = {}
-        if not for_update:
-            for k in _PER_REQ:
-                per[k] = False
-        if isinstance(obs, str) and obs.strip():
-            per["observaciones"] = obs.strip()
-        if "violencia" in out and out["violencia"] is not None:
-            per["violencia"] = _as_bool(out["violencia"], "violencia")
-            out.pop("violencia", None)
-        if "diabetes_tipo" in out and out["diabetes_tipo"] is not None:
-            per["diabetes_tipo"] = _norm_str(out["diabetes_tipo"], "diabetes_tipo")
-            out.pop("diabetes_tipo", None)
-        out["antecedentes_personales"] = per if per else {k: False for k in _PER_REQ}
-    if "violencia" in out and isinstance(out.get("antecedentes_personales"), dict):
-        out["antecedentes_personales"]["violencia"] = _as_bool(out["violencia"], "violencia")
-        out.pop("violencia", None)
-    if "diabetes_tipo" in out and isinstance(out.get("antecedentes_personales"), dict):
-        out["antecedentes_personales"]["diabetes_tipo"] = _norm_str(out["diabetes_tipo"], "diabetes_tipo")
-        out.pop("diabetes_tipo", None)
-    return out
-
+# --- Estos dos siguen siendo 'partial' para UPDATE (ya existían) ---
 def _norm_antecedentes_familiares_partial(obj: dict) -> dict:
     if not isinstance(obj, dict):
         raise ValueError("antecedentes_familiares debe ser objeto")
@@ -310,6 +385,15 @@ def _norm_antecedentes_personales_partial(obj: dict) -> dict:
         out["antecedente_gemelares"] = _as_bool(obj["antecedente_gemelares"], "antecedentes_personales.antecedente_gemelares")
     if "observaciones" in obj and obj["observaciones"] is not None:
         out["observaciones"] = _norm_str(obj["observaciones"], "antecedentes_personales.observaciones")
+
+    # permitir actualización parcial de peso_ultimo_previo (acepta legacy y enum)
+    if "peso_ultimo_previo" in obj and obj["peso_ultimo_previo"] is not None:
+        p = _norm_str(obj["peso_ultimo_previo"], "antecedentes_personales.peso_ultimo_previo")
+        mapped = _map_peso_client_to_schema(p)
+        if mapped is None or mapped not in _PESO_ULTIMO_PREVIO_ENUM:
+            raise ValueError("antecedentes_personales.peso_ultimo_previo inválido")
+        out["peso_ultimo_previo"] = mapped
+
     if "diabetes_tipo" in obj and obj["diabetes_tipo"] is not None:
         dt = _norm_str(obj["diabetes_tipo"], "antecedentes_personales.diabetes_tipo")
         if dt not in _DIABETES_TIPO:
@@ -356,8 +440,9 @@ def crear_antecedentes(
                if payload.get("identificacion_id") else {}),
             **({"usuario_id": _to_oid(usuario_actual["usuario_id"], "usuario_id")}
                if usuario_actual and usuario_actual.get("usuario_id") else {}),
-            "antecedentes_familiares": _norm_antecedentes_familiares(payload["antecedentes_familiares"]),
-            "antecedentes_personales": _norm_antecedentes_personales(payload["antecedentes_personales"]),
+            # RELAJADO: completa faltantes con False
+            "antecedentes_familiares": _norm_antecedentes_familiares(payload.get("antecedentes_familiares", {})),
+            "antecedentes_personales": _norm_antecedentes_personales(payload.get("antecedentes_personales", {})),
             "gesta_previa": _as_nonneg_int(payload["gesta_previa"], "gesta_previa"),
             "partos": _as_nonneg_int(payload["partos"], "partos"),
             "cesareas": _as_nonneg_int(payload["cesareas"], "cesareas"),
@@ -472,7 +557,8 @@ def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
             upd["fracaso_metodo_anticonceptivo"] = _norm_enum(
                 upd["fracaso_metodo_anticonceptivo"], _FRACASO_METODO, "fracaso_metodo_anticonceptivo"
             )
-        # NUEVO: tiempo_desde_ultimo_embarazo
+
+        # NUEVO: permitir establecer/forzar tiempo_desde_ultimo_embarazo
         fecha_en_update = None
         if "fecha_fin_ultimo_embarazo" in upd and upd["fecha_fin_ultimo_embarazo"]:
             fecha_en_update = _parse_date(upd["fecha_fin_ultimo_embarazo"], "fecha_fin_ultimo_embarazo")
@@ -503,7 +589,7 @@ def actualizar_antecedentes_por_id(ant_id: str, payload: dict, session=None):
             # upd["tiempo_desde_ultimo_embarazo"] = _clasificar_tiempo_desde_ultimo_embarazo(fecha_en_update)
             pass
 
-        # Subdocumentos
+        # Subdocumentos (parciales en update)
         if "antecedentes_familiares" in upd and upd["antecedentes_familiares"] is not None:
             upd["antecedentes_familiares"] = _norm_antecedentes_familiares_partial(upd["antecedentes_familiares"])
         if "antecedentes_personales" in upd and upd["antecedentes_personales"] is not None:

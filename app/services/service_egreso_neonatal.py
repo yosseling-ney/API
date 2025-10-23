@@ -1,3 +1,4 @@
+# app/services/service_egreso_neonatal.py
 from datetime import datetime
 from bson import ObjectId
 from app import mongo
@@ -58,12 +59,26 @@ def _as_nonneg_float(v, field):
 
 def _parse_dt(dt_str: str, field="fecha_hora_evento"):
     """
-    Acepta "YYYY-MM-DD HH:MM" o "DD/MM/YYYY HH:MM" o solo fecha ("YYYY-MM-DD" / "DD/MM/YYYY", asumiendo 00:00).
+    Acepta:
+      - 'YYYY-MM-DD HH:MM'
+      - 'DD/MM/YYYY HH:MM'
+      - 'YYYY-MM-DD' o 'DD/MM/YYYY' (asume 00:00)
+      - 'YYYY-MM-DD HH:MM:SS'
+      - ISO: 'YYYY-MM-DDTHH:MM' o 'YYYY-MM-DDTHH:MM:SS'
     """
     if not isinstance(dt_str, str):
         raise ValueError(f"{field} debe ser string")
     s = dt_str.strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+    formatos = (
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    )
+    for fmt in formatos:
         try:
             dt = datetime.strptime(s, fmt)
             if fmt in ("%Y-%m-%d", "%d/%m/%Y"):
@@ -71,7 +86,7 @@ def _parse_dt(dt_str: str, field="fecha_hora_evento"):
             return dt
         except ValueError:
             continue
-    raise ValueError(f"{field} debe tener formato 'YYYY-MM-DD HH:MM' o 'DD/MM/YYYY HH:MM'")
+    raise ValueError(f"{field} debe tener formato 'YYYY-MM-DD HH:MM' (o equivalentes aceptados)")
 
 def _require_core(payload: dict):
     faltan = [f for f in _REQUIRED_CORE if f not in payload]
@@ -95,10 +110,18 @@ def _serialize(doc: dict):
         "paciente_id": str(doc["paciente_id"]) if doc.get("paciente_id") else None,  # apoyo/migración
         "identificacion_id": str(doc["identificacion_id"]) if doc.get("identificacion_id") else None,
         "usuario_id": str(doc["usuario_id"]) if doc.get("usuario_id") else None,
+
         "estado": doc.get("estado"),  # 'vivo' | 'traslado' | 'fallece'
         "fecha_hora_evento": doc["fecha_hora_evento"].strftime("%Y-%m-%d %H:%M") if doc.get("fecha_hora_evento") else None,
+
+        # Traslado
         "codigo_traslado": doc.get("codigo_traslado"),
         "fallece_durante_traslado": doc.get("fallece_durante_traslado"),  # 'si' | 'no' | None
+
+        # Fallece fuera de lugar de nacimiento
+        "fallece_fuera_lugar_nacimiento": doc.get("fallece_fuera_lugar_nacimiento"),  # 'si'|'no'|None
+        "codigo_establecimiento_fallecimiento": doc.get("codigo_establecimiento_fallecimiento"),
+
         "edad_egreso_dias": doc.get("edad_egreso_dias"),
         "id_rn": doc.get("id_rn"),
         "alimento_alta": doc.get("alimento_alta"),
@@ -120,10 +143,9 @@ def crear_egreso_neonatal(
 ):
     """
     Crea egreso RN ORIENTADO A HISTORIAL.
-    Firma: historial_id (FK principal).
-    Payload (núcleo): _REQUIRED_CORE.
-    Condicionales: si estado == 'traslado' => codigo_traslado (no vacío) y fallece_durante_traslado ('si'|'no').
-    Opcionales: paciente_id, identificacion_id. usuario_actual.usuario_id para auditoría.
+    - Si estado = 'traslado' => obligatorio: codigo_traslado (no vacío) y fallece_durante_traslado ('si'|'no').
+    - Si estado = 'fallece'  => si fallece_fuera_lugar_nacimiento = 'si' => obligatorio codigo_establecimiento_fallecimiento.
+    - En 'vivo' se anulan campos de traslado/fallecimiento.
     """
     try:
         if not isinstance(payload, dict):
@@ -148,21 +170,51 @@ def crear_egreso_neonatal(
         boca_arriba = _norm_enum(payload["boca_arriba"], _SI_NO_ENUM, "boca_arriba")
         bcg = _norm_enum(payload["bcg_aplicada"], _SI_NO_ENUM, "bcg_aplicada")
 
-        # Validaciones condicionales por estado
+        # --- Campos de traslado / fallecimiento
         codigo_traslado = (payload.get("codigo_traslado") or "").strip()
         fallece_valor = payload.get("fallece_durante_traslado")
         fallece_durante_traslado = None
 
+        fallece_fuera_lugar_nacimiento_val = payload.get("fallece_fuera_lugar_nacimiento")
+        fallece_fuera_lugar_nacimiento = None
+        codigo_estab_fallecimiento = (payload.get("codigo_establecimiento_fallecimiento") or "").strip()
+
+        # Validaciones condicionales por estado
         if estado == "traslado":
             if not codigo_traslado:
                 return _fail("Si estado = 'traslado', 'codigo_traslado' es obligatorio", 422)
             if fallece_valor is None:
                 return _fail("Si estado = 'traslado', 'fallece_durante_traslado' es obligatorio ('si'|'no')", 422)
             fallece_durante_traslado = _norm_enum(fallece_valor, _SI_NO_ENUM, "fallece_durante_traslado")
-        else:
-            # En 'vivo' o 'fallece' no aplica traslado
+            # En traslado no aplica info de fallecimiento fuera del lugar de nacimiento
+            fallece_fuera_lugar_nacimiento = None
+            codigo_estab_fallecimiento = None
+
+        elif estado == "fallece":
+            # En fallece, traslado no aplica
             codigo_traslado = None
             fallece_durante_traslado = None
+            # Validar “fuera del lugar de nacimiento”
+            if fallece_fuera_lugar_nacimiento_val is not None:
+                fallece_fuera_lugar_nacimiento = _norm_enum(
+                    fallece_fuera_lugar_nacimiento_val, _SI_NO_ENUM, "fallece_fuera_lugar_nacimiento"
+                )
+                if fallece_fuera_lugar_nacimiento == "si" and not codigo_estab_fallecimiento:
+                    return _fail(
+                        "Si 'fallece_fuera_lugar_nacimiento' = 'si', 'codigo_establecimiento_fallecimiento' es obligatorio",
+                        422
+                    )
+            else:
+                # si no se envía, queda None (no marcado)
+                fallece_fuera_lugar_nacimiento = None
+                codigo_estab_fallecimiento = None
+
+        else:  # estado == "vivo"
+            # En vivo no aplica traslado ni fallecimiento
+            codigo_traslado = None
+            fallece_durante_traslado = None
+            fallece_fuera_lugar_nacimiento = None
+            codigo_estab_fallecimiento = None
 
         doc = {
             "historial_id": h_oid,
@@ -184,11 +236,18 @@ def crear_egreso_neonatal(
             "updated_at": datetime.utcnow(),
         }
 
+        # set condicionales
         if codigo_traslado is not None:
             doc["codigo_traslado"] = codigo_traslado
         if fallece_durante_traslado is not None:
             doc["fallece_durante_traslado"] = fallece_durante_traslado
-        res = mongo.db.egreso_neonatal.insert_one(doc, session=session) if session else mongo.db.egreso_neonatal.insert_one(doc)
+        if fallece_fuera_lugar_nacimiento is not None:
+            doc["fallece_fuera_lugar_nacimiento"] = fallece_fuera_lugar_nacimiento
+        if codigo_estab_fallecimiento:
+            doc["codigo_establecimiento_fallecimiento"] = codigo_estab_fallecimiento
+
+        res = (mongo.db.egreso_neonatal.insert_one(doc, session=session)
+               if session else mongo.db.egreso_neonatal.insert_one(doc))
         return _ok({"id": str(res.inserted_id)}, 201)
 
     except ValueError as ve:
@@ -205,7 +264,7 @@ def obtener_egreso_neonatal_por_id(egreso_id: str):
         return _ok(_serialize(doc), 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al obtener datos", 400)
 
 def obtener_egreso_neonatal_por_historial(historial_id: str):
@@ -218,7 +277,7 @@ def obtener_egreso_neonatal_por_historial(historial_id: str):
         return _ok(_serialize(doc), 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al obtener datos", 400)
 
 # ---- Soporte/migración (opcional)
@@ -232,19 +291,24 @@ def get_egreso_neonatal_by_id_paciente(paciente_id: str):
         return _ok(_serialize(doc), 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al obtener datos", 400)
 
 def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=None):
     """
     Actualiza por _id. Permite cambiar historial_id (validando existencia).
-    Re-normaliza enums y fecha si vienen y aplica coherencias de traslado.
+    Re-normaliza enums y fecha si vienen y aplica coherencias de traslado/fallece,
+    incluso cuando 'estado' NO viene en el payload (usa el estado efectivo).
     """
     try:
         if not isinstance(payload, dict):
             return _fail("JSON inválido", 400)
 
         oid = _to_oid(egreso_id, "egreso_id")
+        current = mongo.db.egreso_neonatal.find_one({"_id": oid})
+        if not current:
+            return _fail("No se encontró el documento", 404)
+
         update = dict(payload)
 
         # FK principal
@@ -275,6 +339,12 @@ def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=Non
         if "fallece_durante_traslado" in update and update["fallece_durante_traslado"] is not None:
             update["fallece_durante_traslado"] = _norm_enum(update["fallece_durante_traslado"], _SI_NO_ENUM, "fallece_durante_traslado")
 
+        if "fallece_fuera_lugar_nacimiento" in update and update["fallece_fuera_lugar_nacimiento"] is not None:
+            update["fallece_fuera_lugar_nacimiento"] = _norm_enum(update["fallece_fuera_lugar_nacimiento"], _SI_NO_ENUM, "fallece_fuera_lugar_nacimiento")
+
+        if "codigo_establecimiento_fallecimiento" in update and update["codigo_establecimiento_fallecimiento"] is not None:
+            update["codigo_establecimiento_fallecimiento"] = str(update["codigo_establecimiento_fallecimiento"]).strip()
+
         if "edad_egreso_dias" in update and update["edad_egreso_dias"] is not None:
             update["edad_egreso_dias"] = _as_nonneg_int(update["edad_egreso_dias"], "edad_egreso_dias")
 
@@ -290,20 +360,43 @@ def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=Non
         if "bcg_aplicada" in update and update["bcg_aplicada"] is not None:
             update["bcg_aplicada"] = _norm_enum(update["bcg_aplicada"], _SI_NO_ENUM, "bcg_aplicada")
 
-        # Coherencia condicional según estado (solo si estado está presente en el update)
-        if "estado" in update:
-            if update["estado"] == "traslado":
-                # En traslado: exigir que codigo_traslado (si vino) no sea vacío y normalizar fallece_durante_traslado
-                if "codigo_traslado" in update and not update["codigo_traslado"]:
-                    return _fail("Si estado = 'traslado', 'codigo_traslado' no puede ser vacío", 422)
-                if "fallece_durante_traslado" in update and update["fallece_durante_traslado"] is None:
+        # -------- Coherencia usando estado efectivo --------
+        estado_efectivo = update.get("estado") or current.get("estado")
+
+        if estado_efectivo == "traslado":
+            if "codigo_traslado" in update and update["codigo_traslado"] == "":
+                return _fail("Si estado = 'traslado', 'codigo_traslado' no puede ser vacío", 422)
+
+            # Si se tocan campos de traslado, asegurar tener fallece_durante_traslado (nuevo o actual)
+            if ("codigo_traslado" in update or "fallece_durante_traslado" in update):
+                if update.get("fallece_durante_traslado") is None and current.get("fallece_durante_traslado") is None:
                     return _fail("Si estado = 'traslado', 'fallece_durante_traslado' es obligatorio ('si'|'no')", 422)
-            else:
-                # En vivo/fallece: no aplica traslado
-                if "codigo_traslado" in update:
-                    update["codigo_traslado"] = None
-                if "fallece_durante_traslado" in update:
-                    update["fallece_durante_traslado"] = None
+
+            # En traslado no aplica fallece fuera del lugar
+            update["fallece_fuera_lugar_nacimiento"] = None
+            update["codigo_establecimiento_fallecimiento"] = None
+
+        elif estado_efectivo == "fallece":
+            # En fallece, traslado no aplica
+            update["codigo_traslado"] = None
+            update["fallece_durante_traslado"] = None
+
+            # Si (nuevo o actual) marca fuera del lugar = 'si', debe haber código (nuevo o actual)
+            ff_new = update.get("fallece_fuera_lugar_nacimiento")
+            ff_eff = ff_new if ff_new is not None else current.get("fallece_fuera_lugar_nacimiento")
+            if ff_eff == "si":
+                cod_final = update.get("codigo_establecimiento_fallecimiento", current.get("codigo_establecimiento_fallecimiento"))
+                if not cod_final:
+                    return _fail(
+                        "Si 'fallece_fuera_lugar_nacimiento' = 'si', 'codigo_establecimiento_fallecimiento' es obligatorio",
+                        422
+                    )
+
+        else:  # vivo
+            update["codigo_traslado"] = None
+            update["fallece_durante_traslado"] = None
+            update["fallece_fuera_lugar_nacimiento"] = None
+            update["codigo_establecimiento_fallecimiento"] = None
 
         update["updated_at"] = datetime.utcnow()
 
@@ -314,7 +407,7 @@ def actualizar_egreso_neonatal_por_id(egreso_id: str, payload: dict, session=Non
 
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al actualizar", 400)
 
 def eliminar_egreso_neonatal_por_id(egreso_id: str, session=None):
@@ -326,7 +419,7 @@ def eliminar_egreso_neonatal_por_id(egreso_id: str, session=None):
         return _ok({"mensaje": "Egreso neonatal eliminado"}, 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al eliminar", 400)
 
 def eliminar_egreso_neonatal_por_historial_id(historial_id: str, session=None):
@@ -338,5 +431,5 @@ def eliminar_egreso_neonatal_por_historial_id(historial_id: str, session=None):
         return _ok({"mensaje": f"Se eliminaron {res.deleted_count} egresos neonatales"}, 200)
     except ValueError as ve:
         return _fail(str(ve), 422)
-    except Exception as e:
+    except Exception:
         return _fail("Error al eliminar", 400)
