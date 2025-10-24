@@ -521,11 +521,14 @@ def buscar_paciente_por_codigo_expediente(codigo: str):
     try:
         if not isinstance(codigo, str):
             return _fail("codigo_expediente debe ser string", 422)
-        codigo = codigo.strip().upper()
-        if not _RE_EXPED.match(codigo):
+        # Normalizar: mayúsculas y eliminar separadores no alfanuméricos
+        codigo = (codigo or "").strip().upper()
+        codigo_limpio = re.sub(r"[^0-9A-Z]", "", codigo)
+        # Validar contra el patrón canónico (sin separadores)
+        if not _RE_EXPED.match(codigo_limpio):
             return _fail("codigo_expediente con formato inválido", 422)
-
-        doc = mongo.db.paciente.find_one({"codigo_expediente": codigo})
+        # Buscar usando valor limpio
+        doc = mongo.db.paciente.find_one({"codigo_expediente": codigo_limpio})
         if not doc:
             return _fail("No existe paciente con ese codigo_expediente", 404)
         return _ok(_serialize(doc), 200)

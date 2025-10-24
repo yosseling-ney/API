@@ -81,10 +81,18 @@ def _resolver_paciente_id_por_hint(*, paciente_id=None, tipo_identificacion=None
 @bp.get("/")
 def list_mensajes():
     paciente_id = request.args.get("paciente_id")
+    try:
+        print(f"[mensajes] paciente_id raw={repr(paciente_id)}")
+        if paciente_id:
+            parsed = svc._oid(paciente_id)
+            print(f"[mensajes] paciente_id parsed={parsed}")
+    except Exception:
+        pass
     # Hints opcionales para filtrar por paciente sin conocer el ID
     tipo_identificacion = request.args.get("tipo_identificacion")
     numero_identificacion = request.args.get("numero_identificacion")
-    codigo_expediente = request.args.get("codigo_expediente")
+    # Aceptar alias 'expediente' además de 'codigo_expediente'
+    codigo_expediente = request.args.get("codigo_expediente") or request.args.get("expediente")
     nombre = request.args.get("nombre")
     apellido = request.args.get("apellido")
     q = request.args.get("q")
@@ -141,11 +149,12 @@ def crear_mensaje():
         body["created_by"] = usuario_actual.get("usuario_id")
     # Resolver paciente por hints si no vino paciente_id
     if not body.get("paciente_id"):
+        exp_hint = body.get("codigo_expediente") or body.get("expediente")
         pid, err, err_code = _resolver_paciente_id_por_hint(
             paciente_id=None,
             tipo_identificacion=body.get("tipo_identificacion"),
             numero_identificacion=body.get("numero_identificacion"),
-            codigo_expediente=body.get("codigo_expediente"),
+            codigo_expediente=exp_hint,
             nombre=body.get("nombre"),
             apellido=body.get("apellido"),
             q=body.get("q"),

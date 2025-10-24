@@ -10,12 +10,30 @@ def _now() -> datetime:
 
 
 def _oid(val: Optional[str]) -> Optional[ObjectId]:
-    if not val:
+    """Convierte a ObjectId tolerando espacios, mayúsculas y separadores.
+
+    - trim
+    - intento directo
+    - si falla, elimina cualquier carácter no hex y reintenta
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
         return None
     try:
-        return ObjectId(val)
+        return ObjectId(s)
     except Exception:
-        return None
+        pass
+    # Intento con solo hex (elimina separadores invisibles o erróneos)
+    import re as _re
+    s2 = _re.sub(r"[^0-9a-fA-F]", "", s)
+    if len(s2) == 24:
+        try:
+            return ObjectId(s2)
+        except Exception:
+            return None
+    return None
 
 
 def _serialize(doc: dict | None) -> Optional[dict]:
