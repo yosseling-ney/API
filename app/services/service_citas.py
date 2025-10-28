@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+import re
 from bson import ObjectId
 from flask import current_app
 from app import mongo
@@ -266,6 +267,88 @@ def listar_historicas(desde_utc: datetime | None = None, hasta_utc: datetime | N
         return _ok({"items": items, "total": total}, 200)
     except Exception:
         return _fail("Error al listar citas históricas", 500)
+
+
+def buscar_citas(
+    q: Optional[str] = None,
+    paciente_nombre: Optional[str] = None,
+    desde_utc: Optional[datetime] = None,
+    hasta_utc: Optional[datetime] = None,
+    page: int = 1,
+    per_page: int = 20,
+    status: Optional[str] = None,
+):
+    """
+    Busca citas por:
+    - q: texto en title / provider (insensible a mayúsculas)
+    - paciente_nombre: busca pacientes cuyo nombre o apellido coincida (regex) y filtra por sus IDs
+    - rango de fechas (start_at) y status opcional
+    - paginación (page, per_page)
+    Orden por start_at DESC.
+    """
+    try:
+        _ensure_indexes()
+        query: dict = {}
+
+        # status (opcional)
+        if status and status in _STATUS_ENUM:
+            query["status"] = status
+
+        # rango fechas (UTC naive)
+        desde_utc = _to_naive(desde_utc) or desde_utc
+        hasta_utc = _to_naive(hasta_utc) or hasta_utc
+        if desde_utc is not None or hasta_utc is not None:
+            rng = {}
+            if desde_utc is not None:
+                rng["$gte"] = desde_utc
+            if hasta_utc is not None:
+                rng["$lte"] = hasta_utc
+            if rng:
+                query["start_at"] = rng
+
+        # texto en title / provider
+        ors = []
+        if q and isinstance(q, str) and q.strip():
+            safe = re.escape(q.strip())
+            regex = re.compile(safe, re.IGNORECASE)
+            ors.append({"title": {"$regex": regex}})
+            ors.append({"provider": {"$regex": regex}})
+
+        # por nombre de paciente: obtener IDs coincidentes (limit para evitar $in enorme)
+        if paciente_nombre and isinstance(paciente_nombre, str) and paciente_nombre.strip():
+            p_safe = re.escape(paciente_nombre.strip())
+            p_regex = re.compile(p_safe, re.IGNORECASE)
+            pac_ids = [
+                doc["_id"]
+                for doc in mongo.db.paciente.find(
+                    {"$or": [{"nombre": {"$regex": p_regex}}, {"apellido": {"$regex": p_regex}}]},
+                    {"_id": 1},
+                ).limit(100)
+            ]
+            if not pac_ids:
+                return _ok({"items": [], "total": 0, "page": page, "per_page": per_page}, 200)
+            query["paciente_id"] = {"$in": pac_ids}
+
+        if ors:
+            query["$or"] = ors
+
+        # paginación
+        page = max(int(page or 1), 1)
+        per_page = max(min(int(per_page or 20), 200), 1)
+        skip = (page - 1) * per_page
+
+        total = mongo.db.citas.count_documents(query)
+        cur = (
+            mongo.db.citas
+            .find(query)
+            .sort("start_at", -1)
+            .skip(skip)
+            .limit(per_page)
+        )
+        items = [_serialize(d) for d in cur]
+        return _ok({"items": items, "total": total, "page": page, "per_page": per_page}, 200)
+    except Exception as e:
+        return _fail("Error en la búsqueda de citas", 500)
 
 
 _STATUS_ENUM = {"scheduled", "completed", "cancelled"}

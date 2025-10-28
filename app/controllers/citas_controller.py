@@ -7,6 +7,7 @@ from app.services.service_citas import (
     listar_proximas,
     listar_activas,
     listar_historicas,
+    buscar_citas,
     actualizar_cita,
     eliminar_cita,
 )
@@ -128,6 +129,34 @@ def get_historicas():
     desde = _parse_ymd_local_to_utc(request.args.get("desde"))
     hasta = _parse_ymd_local_to_utc(request.args.get("hasta"), end_of_day=True)
     res, code = listar_historicas(desde_utc=desde, hasta_utc=hasta, limit=limit)
+    return jsonify(res), code
+
+
+def get_search():
+    # Parámetros: q (título/doctor), paciente (nombre), desde, hasta, page, per_page, status
+    q = request.args.get("q")
+    paciente = request.args.get("paciente")
+    try:
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 20))
+    except Exception:
+        return jsonify(_fail("page/per_page inválidos", 422)[0]), 422
+    status = request.args.get("status")
+    if status and status not in {"scheduled", "completed", "cancelled"}:
+        status = None
+
+    desde = _parse_ymd_local_to_utc(request.args.get("desde"))
+    hasta = _parse_ymd_local_to_utc(request.args.get("hasta"), end_of_day=True)
+
+    res, code = buscar_citas(
+        q=q,
+        paciente_nombre=paciente,
+        desde_utc=desde,
+        hasta_utc=hasta,
+        page=page,
+        per_page=per_page,
+        status=status,
+    )
     return jsonify(res), code
 
 

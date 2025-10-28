@@ -76,6 +76,8 @@ def init_indexes():
     _safe_create("citas", [("start_at", ASCENDING)], name="ix_citas_start_at")
     _safe_create("citas", [("paciente_id", ASCENDING)], name="ix_citas_paciente")
     _safe_create("citas", [("status", ASCENDING)], name="ix_citas_status")
+    _safe_create("citas", [("provider", ASCENDING)], name="ix_citas_provider")
+    _safe_create("citas", [("title", ASCENDING)], name="ix_citas_title")
     # Evitar doble reserva exacta: mismo doctor (provider) y misma hora (start_at) mientras esté programada
     try:
         get_db()["citas"].create_index(
