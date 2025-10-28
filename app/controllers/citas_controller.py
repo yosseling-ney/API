@@ -1,44 +1,109 @@
-from flask import request
-from datetime import datetime
-from dateutil.parser import isoparse
+from flask import request, jsonify
+from datetime import datetime, time, timedelta, timezone
 
-from services.service_citas import crear_cita, listar_hoy, listar_proximas
-from utils.helpers import today_range_utc, next_days_range_utc
+from app.services.service_citas import crear_cita, listar_hoy, listar_proximas, actualizar_cita, eliminar_cita
+from app.utils.helpers import TZ
+
+
+def _ok(data, code=200):
+    return {"ok": True, "data": data, "error": None}, code
+
+
+def _fail(msg, code=400):
+    return {"ok": False, "data": None, "error": msg}, code
+
+
+def _range_today_system_tz():
+    """Devuelve (start_utc, end_utc) del día actual en el sistema (TZ de helpers)."""
+    now_local = datetime.now(TZ)
+    start_local = datetime.combine(now_local.date(), time.min).replace(tzinfo=TZ)
+    end_local = datetime.combine(now_local.date(), time.max).replace(tzinfo=TZ)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _range_next_days_from_tomorrow_system_tz(days: int):
+    """Desde el inicio de mañana local, hasta el fin del día (hoy+days) local."""
+    days = int(days)
+    now_local = datetime.now(TZ)
+    tomorrow_date = (now_local + timedelta(days=1)).date()
+    start_local = datetime.combine(tomorrow_date, time.min).replace(tzinfo=TZ)
+    # fin del rango: fin de (hoy + days)
+    end_date = (now_local + timedelta(days=days)).date()
+    end_local = datetime.combine(end_date, time.max).replace(tzinfo=TZ)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _range_from_tomorrow_paged_system_tz(page: int, per_days: int):
+    """
+    Paginación por ventanas de días desde mañana:
+    - page >= 1, per_days (cap 90)
+    - ventana: [mañana + (page-1)*per_days, (mañana + page*per_days - 1) endOfDay]
+    """
+    page = max(int(page), 1)
+    per_days = max(min(int(per_days), 90), 1)
+    now_local = datetime.now(TZ)
+    base_date = (now_local + timedelta(days=1)).date()  # mañana
+    start_date = base_date + timedelta(days=(page - 1) * per_days)
+    end_date = base_date + timedelta(days=page * per_days - 1)
+    start_local = datetime.combine(start_date, time.min).replace(tzinfo=TZ)
+    end_local = datetime.combine(end_date, time.max).replace(tzinfo=TZ)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
 
 def get_hoy():
-    limit = int(request.args.get("limit", 100))
-    start_utc, end_utc = today_range_utc()
-    return listar_hoy(start_utc, end_utc, limit), 200
+    # “Fecha actual (en el sistema)” => usar TZ del sistema (helpers.TZ)
+    try:
+        limit = int(request.args.get("limit", 100))
+    except Exception:
+        return jsonify(_fail("limit inválido", 422)[0]), 422
+    start_utc, end_utc = _range_today_system_tz()
+    res, code = listar_hoy(start_utc, end_utc, limit)
+    return jsonify(res), code
+
 
 def get_proximas():
-    days = int(request.args.get("days", 7))
-    limit = int(request.args.get("limit", 200))
-    start_utc, end_utc = next_days_range_utc(days)
-    return listar_proximas(start_utc, end_utc, limit), 200
+    # “A partir de mañana en adelante” => desde inicio de mañana local
+    try:
+        limit = int(request.args.get("limit", 200))
+    except Exception:
+        return jsonify(_fail("parámetros inválidos", 422)[0]), 422
+
+    # Si viene paginación por días (page/per_days), se usa esa ventana con cap 90 días
+    page_q = request.args.get("page")
+    if page_q is not None:
+        try:
+            page = max(int(page_q), 1)
+            per_days = int(request.args.get("per_days") or request.args.get("perDays") or 90)
+        except Exception:
+            return jsonify(_fail("page/per_days inválidos", 422)[0]), 422
+        start_utc, end_utc = _range_from_tomorrow_paged_system_tz(page, per_days)
+    else:
+        # Default: 7 días; permitir hasta 30 días por razones de UX/rendimiento
+        try:
+            days = int(request.args.get("dias") or request.args.get("days", 7))
+        except Exception:
+            return jsonify(_fail("days/dias inválido", 422)[0]), 422
+        days = max(min(days, 30), 1)
+        start_utc, end_utc = _range_next_days_from_tomorrow_system_tz(days)
+    res, code = listar_proximas(start_utc, end_utc, limit)
+    return jsonify(res), code
+
 
 def post_crear():
-    payload = request.get_json(force=True) or {}
-    paciente_id = payload.get("paciente_id")
-    start_at = payload.get("start_at")
-    end_at = payload.get("end_at")
+    payload = request.get_json(silent=True) or {}
+    # Dejar validación al servicio para mantener mensajes consistentes
+    res, code = crear_cita(payload)
+    return jsonify(res), code
 
-    if not paciente_id or not start_at:
-        return {"message": "paciente_id y start_at son requeridos"}, 400
 
-    try:
-        start_dt = isoparse(start_at)
-        end_dt = isoparse(end_at) if end_at else None
-        item = crear_cita(
-            paciente_id=paciente_id,
-            start_at=start_dt,
-            end_at=end_dt,
-            title=payload.get("title"),
-            description=payload.get("description"),
-            provider=payload.get("provider"),
-            location=payload.get("location"),
-        )
-        return item, 201
-    except ValueError as ve:
-        return {"message": str(ve)}, 400
-    except Exception as e:
-        return {"message": "No se pudo crear la cita"}, 500
+def patch_actualizar(cita_id: str):
+    payload = request.get_json(silent=True) or {}
+    res, code = actualizar_cita(cita_id, payload)
+    return jsonify(res), code
+
+
+def delete_eliminar(cita_id: str):
+    hard = request.args.get("hard")
+    hard_flag = True if hard in ("1", "true", "True") else False
+    res, code = eliminar_cita(cita_id, hard=hard_flag)
+    return jsonify(res), code

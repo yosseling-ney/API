@@ -1,17 +1,12 @@
 from flask import Blueprint
-from controllers.citas_controller import get_hoy, get_proximas, post_crear
-# Si requieres auth: from utils.jwt_manager import login_required
+from app.controllers.citas_controller import get_hoy, get_proximas, post_crear, patch_actualizar, delete_eliminar
 
-citas_bp = Blueprint("citas", __name__)
+# Nota: si deseas proteger con JWT, importa y aplica decoradores aquí.
 
-@citas_bp.get("/hoy")
-def r_hoy():
-    return get_hoy()
+bp = Blueprint("citas", __name__, url_prefix="/citas")
 
-@citas_bp.get("/proximas")
-def r_proximas():
-    return get_proximas()
-
-@citas_bp.post("")
-def r_crear():
-    return post_crear()
+bp.add_url_rule("/hoy", view_func=get_hoy, methods=["GET"])
+bp.add_url_rule("/proximas", view_func=get_proximas, methods=["GET"])
+bp.add_url_rule("/", view_func=post_crear, methods=["POST"])
+bp.add_url_rule("/<cita_id>", view_func=patch_actualizar, methods=["PATCH"])
+bp.add_url_rule("/<cita_id>", view_func=delete_eliminar, methods=["DELETE"])

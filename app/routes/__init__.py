@@ -3,6 +3,7 @@ from app.controllers.historial_controller import bp as historiales_bp
 from app.controllers.medicos_controller import medicos_bp
 from .settings import bp as settings_bp
 from .mensajes import bp as mensajes_bp
+from .citas import bp as citas_bp
 from app.routes.usuarios import usuarios_bp
 
 # Registrar rutas
@@ -17,3 +18,4 @@ def register_routes(app):
     app.register_blueprint(settings_bp,    url_prefix=with_api(settings_bp))
     app.register_blueprint(mensajes_bp,    url_prefix=with_api(mensajes_bp))
     app.register_blueprint(medicos_bp,     url_prefix=with_api(medicos_bp))
+    app.register_blueprint(citas_bp,       url_prefix=with_api(citas_bp))

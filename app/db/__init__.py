@@ -72,6 +72,11 @@ def init_indexes():
                  name="ix_mensajes_paciente_created")
     _safe_create("mensajes", [("created_at", DESCENDING)], name="ix_mensajes_created")
 
+    # ---------------- citas ----------------
+    _safe_create("citas", [("start_at", ASCENDING)], name="ix_citas_start_at")
+    _safe_create("citas", [("paciente_id", ASCENDING)], name="ix_citas_paciente")
+    _safe_create("citas", [("status", ASCENDING)], name="ix_citas_status")
+
     # ---------------- puerperio ----------------
     _safe_create("puerperio", [("historial_id", ASCENDING), ("created_at", DESCENDING)],
                  name="historial_created_desc_idx")
