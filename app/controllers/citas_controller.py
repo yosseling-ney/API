@@ -1,7 +1,15 @@
 from flask import request, jsonify
 from datetime import datetime, time, timedelta, timezone
 
-from app.services.service_citas import crear_cita, listar_hoy, listar_proximas, actualizar_cita, eliminar_cita
+from app.services.service_citas import (
+    crear_cita,
+    listar_hoy,
+    listar_proximas,
+    listar_activas,
+    listar_historicas,
+    actualizar_cita,
+    eliminar_cita,
+)
 from app.utils.helpers import TZ
 
 
@@ -86,6 +94,40 @@ def get_proximas():
         days = max(min(days, 30), 1)
         start_utc, end_utc = _range_next_days_from_tomorrow_system_tz(days)
     res, code = listar_proximas(start_utc, end_utc, limit)
+    return jsonify(res), code
+
+
+def _parse_ymd_local_to_utc(s: str | None, *, end_of_day: bool = False):
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        t = time.max if end_of_day else time.min
+        local_dt = datetime.combine(dt.date(), t).replace(tzinfo=TZ)
+        return local_dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def get_activas():
+    try:
+        limit = int(request.args.get("limit", 200))
+    except Exception:
+        return jsonify(_fail("limit inválido", 422)[0]), 422
+    desde = _parse_ymd_local_to_utc(request.args.get("desde"))
+    hasta = _parse_ymd_local_to_utc(request.args.get("hasta"), end_of_day=True)
+    res, code = listar_activas(limit=limit, start_utc=desde, end_utc=hasta)
+    return jsonify(res), code
+
+
+def get_historicas():
+    try:
+        limit = int(request.args.get("limit", 200))
+    except Exception:
+        return jsonify(_fail("limit inválido", 422)[0]), 422
+    desde = _parse_ymd_local_to_utc(request.args.get("desde"))
+    hasta = _parse_ymd_local_to_utc(request.args.get("hasta"), end_of_day=True)
+    res, code = listar_historicas(desde_utc=desde, hasta_utc=hasta, limit=limit)
     return jsonify(res), code
 
 
