@@ -48,11 +48,21 @@ def _norm_upper(s):
 
 def _ensure_indexes():
     try:
-        mongo.db.paciente.create_index([("tipo_identificacion", 1), ("numero_identificacion", 1)], unique=True, name="uq_tipo_num_identificacion")
+        mongo.db.paciente.create_index(
+            [("tipo_identificacion", 1), ("numero_identificacion", 1)],
+            unique=True,
+            name="uq_tipo_num_identificacion",
+            partialFilterExpression={"deleted_at": None},
+        )
     except Exception:
         pass
     try:
-        mongo.db.paciente.create_index("codigo_expediente", unique=True, name="uq_codigo_expediente")
+        mongo.db.paciente.create_index(
+            "codigo_expediente",
+            unique=True,
+            name="uq_codigo_expediente",
+            partialFilterExpression={"deleted_at": None},
+        )
     except Exception:
         pass
     try:
@@ -178,11 +188,18 @@ def _generar_codigo_expediente(nombre, apellido, fecha_nac_dt: datetime,
     return codigo
 
 def _serialize(doc: dict):
+    nombres = doc.get("nombres", doc.get("nombre"))
+    apellidos = doc.get("apellidos", doc.get("apellido"))
+    deleted_at = doc.get("deleted_at")
     return {
         "id": str(doc["_id"]),
         "historial_id": str(doc.get("historial_id")) if isinstance(doc.get("historial_id"), ObjectId) else (doc.get("historial_id") or None),
-        "nombre": doc.get("nombre"),
-        "apellido": doc.get("apellido"),
+        "nombres": nombres,
+        "apellidos": apellidos,
+        # Alias legacy para compatibilidad con UI existente
+        "nombre": nombres,
+        "apellido": apellidos,
+        "nombre_completo": doc.get("nombre_completo") or (f"{nombres} {apellidos}".strip() if (nombres or apellidos) else None),
         "tipo_identificacion": doc.get("tipo_identificacion"),
         "numero_identificacion": doc.get("numero_identificacion"),
         "codigo_expediente": doc.get("codigo_expediente"),
@@ -192,18 +209,27 @@ def _serialize(doc: dict):
         "bairro": doc.get("bairro"),
         "gesta_actual": doc.get("gesta_actual"),
         "contacto_emergencia": doc.get("contacto_emergencia"),
-        "activo": doc.get("activo", True),
+        "activo": deleted_at in (None,) if ("deleted_at" in doc) else True,
         # Asegurar serialización JSON (datetime -> ISO8601 string)
         "created_at": (doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else doc.get("created_at")),
         "updated_at": (doc.get("updated_at").isoformat() if isinstance(doc.get("updated_at"), datetime) else doc.get("updated_at")),
+        "deleted_at": (deleted_at.isoformat() if isinstance(deleted_at, datetime) else deleted_at),
+        "deleted_by": (str(doc.get("deleted_by")) if isinstance(doc.get("deleted_by"), ObjectId) else doc.get("deleted_by")),
     }
+
+
+# Migración ad-hoc removida a pedido: mantener código sin endpoint de migración.
 
 # ---------------- Services ----------------
 def buscar_paciente_por_identificacion(tipo_identificacion: str, numero_identificacion: str):
     try:
         tipo = _validar_tipo_identificacion(tipo_identificacion)
         numero = _validar_numero_identificacion(tipo, numero_identificacion)
-        doc = mongo.db.paciente.find_one({"tipo_identificacion": tipo, "numero_identificacion": numero})
+        doc = mongo.db.paciente.find_one({
+            "tipo_identificacion": tipo,
+            "numero_identificacion": numero,
+            "$or": [{"deleted_at": None}, {"deleted_at": {"$exists": False}}],
+        })
         if not doc:
             return _fail("No existe paciente con esa identificacion", 404)
         return _ok(_serialize(doc), 200)
@@ -229,8 +255,11 @@ def crear_paciente(payload: dict, session=None):
 
         _ensure_indexes()
 
-        nombre   = _validar_min_nonempty(payload.get("nombre"), "nombre")
-        apellido = _validar_min_nonempty(payload.get("apellido"), "apellido")
+        # Compat: aceptar `nombres/apellidos` o `nombre/apellido`
+        nombres_in   = payload.get("nombres", payload.get("nombre"))
+        apellidos_in = payload.get("apellidos", payload.get("apellido"))
+        nombre   = _validar_min_nonempty(nombres_in, "nombres")
+        apellido = _validar_min_nonempty(apellidos_in, "apellidos")
         tipo_identificacion = _validar_tipo_identificacion(payload.get("tipo_identificacion"))
         numero_identificacion = _validar_numero_identificacion(tipo_identificacion, payload.get("numero_identificacion"))
         fecha_nac_dt   = _parse_date_ymd(payload.get("fecha_nac"), "fecha_nac")
@@ -240,7 +269,11 @@ def crear_paciente(payload: dict, session=None):
         gesta_actual = _validar_gesta_actual(payload.get("gesta_actual"))
 
         # ya existe?
-        ya = mongo.db.paciente.find_one({"tipo_identificacion": tipo_identificacion, "numero_identificacion": numero_identificacion})
+        ya = mongo.db.paciente.find_one({
+            "tipo_identificacion": tipo_identificacion,
+            "numero_identificacion": numero_identificacion,
+            "$or": [{"deleted_at": None}, {"deleted_at": {"$exists": False}}],
+        })
         if ya:
             return {"ok": False, "data": _serialize(ya), "error": "Paciente ya existe"}, 409
 
@@ -252,7 +285,10 @@ def crear_paciente(payload: dict, session=None):
         control = 0
         while control <= 99:
             codigo = _generar_codigo_expediente(nombre, apellido, fecha_nac_dt, sexo, municipio_codigo, control)
-            if not mongo.db.paciente.find_one({"codigo_expediente": codigo}):
+            if not mongo.db.paciente.find_one({
+                "codigo_expediente": codigo,
+                "$or": [{"deleted_at": None}, {"deleted_at": {"$exists": False}}],
+            }):
                 break
             control += 1
         if control > 99:
@@ -267,8 +303,9 @@ def crear_paciente(payload: dict, session=None):
                 return _fail("historial_id no encontrado en historiales", 404)
 
         doc = {
-            "nombre": nombre.strip(),
-            "apellido": apellido.strip(),
+            "nombres": nombre.strip(),
+            "apellidos": apellido.strip(),
+            "nombre_completo": f"{nombre.strip()} {apellido.strip()}".strip(),
             "tipo_identificacion": tipo_identificacion,
             "numero_identificacion": numero_identificacion,
             "codigo_expediente": codigo,
@@ -277,7 +314,7 @@ def crear_paciente(payload: dict, session=None):
             "direccion": direccion,
             "bairro": bairro,
             "gesta_actual": gesta_actual,
-            "activo": True,
+            "deleted_at": None,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
@@ -342,10 +379,15 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
                     return _fail("historial_id no encontrado en historiales", 404)
                 upd["historial_id"] = h_oid
 
-        if "nombre" in payload and payload["nombre"] is not None:
-            upd["nombre"] = _validar_min_nonempty(payload["nombre"], "nombre")
-        if "apellido" in payload and payload["apellido"] is not None:
-            upd["apellido"] = _validar_min_nonempty(payload["apellido"], "apellido")
+        # Aceptar nombres/apellidos o nombre/apellido (legacy)
+        if "nombres" in payload or "nombre" in payload:
+            val = payload.get("nombres", payload.get("nombre"))
+            if val is not None:
+                upd["nombres"] = _validar_min_nonempty(val, "nombres")
+        if "apellidos" in payload or "apellido" in payload:
+            val = payload.get("apellidos", payload.get("apellido"))
+            if val is not None:
+                upd["apellidos"] = _validar_min_nonempty(val, "apellidos")
 
         if any(k in payload for k in ("tipo_identificacion", "numero_identificacion")):
             doc = _obtener_doc_actual()
@@ -399,8 +441,8 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
             doc_actual = _obtener_doc_actual()
             if not doc_actual:
                 return _fail("Paciente no encontrado", 404)
-            nombre = upd.get("nombre", doc_actual.get("nombre"))
-            apellido = upd.get("apellido", doc_actual.get("apellido"))
+            nombre = upd.get("nombres", doc_actual.get("nombres", doc_actual.get("nombre")))
+            apellido = upd.get("apellidos", doc_actual.get("apellidos", doc_actual.get("apellido")))
             fecha_nac_dt = upd.get("fecha_nac", doc_actual.get("fecha_nac"))
             if not isinstance(fecha_nac_dt, datetime):
                 return _fail("fecha_nac inválida para regenerar código", 422)
@@ -410,7 +452,7 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
             control = 0
             while control <= 99:
                 codigo = _generar_codigo_expediente(nombre, apellido, fecha_nac_dt, sexo, municipio_codigo, control)
-                existe = mongo.db.paciente.find_one({"codigo_expediente": codigo, "_id": {"$ne": oid}})
+                existe = mongo.db.paciente.find_one({"codigo_expediente": codigo, "_id": {"$ne": oid}, "$or": [{"deleted_at": None}, {"deleted_at": {"$exists": False}}]})
                 if not existe:
                     upd["codigo_expediente"] = codigo
                     break
@@ -422,6 +464,13 @@ def actualizar_paciente_por_id(paciente_id: str, payload: dict, session=None):
             return _ok({"mensaje": "Nada para actualizar"}, 200)
 
         upd["updated_at"] = datetime.utcnow()
+        # mantener nombre_completo si hay cambios en nombres o apellidos
+        if "nombres" in upd or "apellidos" in upd:
+            doc_base = doc_actual or mongo.db.paciente.find_one({"_id": oid})
+            n_final = upd.get("nombres", doc_base.get("nombres", doc_base.get("nombre", "")))
+            a_final = upd.get("apellidos", doc_base.get("apellidos", doc_base.get("apellido", "")))
+            upd["nombre_completo"] = f"{n_final} {a_final}".strip()
+
         res = mongo.db.paciente.update_one({"_id": oid}, {"$set": upd}, session=session)
         if res.matched_count == 0:
             return _fail("Paciente no encontrado", 404)
@@ -444,7 +493,7 @@ def eliminar_paciente_por_id(paciente_id: str, hard: bool = False, session=None)
                 return _fail("Paciente no encontrado", 404)
             return _ok({"mensaje": "Paciente eliminado definitivamente"}, 200)
         else:
-            res = mongo.db.paciente.update_one({"_id": oid}, {"$set": {"activo": False, "updated_at": datetime.utcnow()}}, session=session)
+            res = mongo.db.paciente.update_one({"_id": oid}, {"$set": {"deleted_at": datetime.utcnow()}}, session=session)
             if res.matched_count == 0:
                 return _fail("Paciente no encontrado", 404)
             return _ok({"mensaje": "Paciente desactivado"}, 200)
@@ -460,7 +509,7 @@ def listar_pacientes(q: str | None = None, page: int = 1, per_page: int = 20, so
 
         filtro = {}
         if solo_activos:
-            filtro["activo"] = True
+            filtro["$or"] = [{"deleted_at": None}, {"deleted_at": {"$exists": False}}]
 
         if q and isinstance(q, str) and q.strip():
             rx = {"$regex": re.escape(q.strip()), "$options": "i"}
