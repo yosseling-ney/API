@@ -6,6 +6,7 @@ from .mensajes import bp as mensajes_bp
 from .citas import bp as citas_bp
 from app.routes.usuarios import usuarios_bp
 from .backup import bp as backup_bp
+from .reportes import bp as reportes_bp
 
 # Registrar rutas
 def register_routes(app):
@@ -21,3 +22,4 @@ def register_routes(app):
     app.register_blueprint(medicos_bp,     url_prefix=with_api(medicos_bp))
     app.register_blueprint(citas_bp,       url_prefix=with_api(citas_bp))
     app.register_blueprint(backup_bp,      url_prefix=with_api(backup_bp))
+    app.register_blueprint(reportes_bp,    url_prefix=with_api(reportes_bp))
