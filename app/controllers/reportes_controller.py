@@ -1,5 +1,5 @@
 from flask import jsonify, request, send_file
-from io import BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime, timezone, timedelta
 import csv
 
@@ -68,6 +68,7 @@ def get_dashboard_pdf():
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import Table, TableStyle
     # Preparar rango de fechas para subtítulo y cálculo
     start_iso = request.args.get("from") or request.args.get("start")
     end_iso = request.args.get("to") or request.args.get("end")
@@ -87,54 +88,96 @@ def get_dashboard_pdf():
     y = height - margin
 
     # Encabezado
+    logo_h = 45  # altura aprox. del logo en puntos
     try:
         logo_path = "app/Images/Ministerio de Salud.jpg"
         logo = ImageReader(logo_path)
-        logo_w = 3.5 * cm
-        c.drawImage(logo, margin, y - 2.5 * cm, width=logo_w, height=2.5 * cm, preserveAspectRatio=True, mask='auto')
+        # Ajuste de tamaño del logo (aprox. 120x45 puntos) y alineación a la izquierda
+        logo_w = 120
+        c.drawImage(logo, margin, y - logo_h, width=logo_w, height=logo_h, preserveAspectRatio=True, mask='auto')
     except Exception:
         pass
 
+    # Espacio pequeño después del logo
+    y = y - (logo_h + 12)
+
     c.setFillColor(colors.HexColor("#01579B"))  # azul institucional
     c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(width / 2, y - 0.5 * cm, "Centro De Salud Jose Rubi")
+    c.drawCentredString(width / 2, y, "Centro De Salud Jose Rubi")
     c.setFont("Helvetica-Bold", 16)
-    c.drawCentredString(width / 2, y - 1.2 * cm, "Reporte de Indicadores del Sistema Prenatal")
+    c.drawCentredString(width / 2, y - 0.7 * cm, "Reporte de Indicadores del Sistema Prenatal")
 
     # Subtítulo con fechas
     c.setFillColor(colors.black)
     c.setFont("Helvetica", 10)
     rango_txt = f"Rango: {start_dt.strftime('%Y-%m-%d')}   {end_dt.strftime('%Y-%m-%d')}"
     generado_txt = f"Generado: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-    c.drawCentredString(width / 2, y - 2.0 * cm, rango_txt)
-    c.drawCentredString(width / 2, y - 2.6 * cm, generado_txt)
+    # Normalizar separador de fechas para evitar caracteres cuadrados
+    rango_txt = f"Rango: {start_dt.strftime('%Y-%m-%d')} a {end_dt.strftime('%Y-%m-%d')}"
+    c.drawCentredString(width / 2, y - 1.6 * cm, rango_txt)
+    c.drawCentredString(width / 2, y - 2.2 * cm, generado_txt)
 
-    y = y - 3.3 * cm
+    y = y - 2.8 * cm
 
     # Tabla de métricas principales
     c.setFont("Helvetica-Bold", 12)
     c.drawString(margin, y, "Métricas principales")
     y -= 0.6 * cm
-    c.setFont("Helvetica", 11)
+    # Reemplazo: tablas con estilo para métricas e indicadores
     cards = data.get("cards", {})
-    c.drawString(margin, y, f"- Pacientes activos: {cards.get('pacientes_activos', {}).get('value', 0)} gestantes")
-    y -= 0.5 * cm
-    c.drawString(margin, y, f"- Citas cumplidas: {cards.get('citas_cumplidas', {}).get('value', 0)}%")
-    y -= 0.5 * cm
-    c.drawString(margin, y, f"- Alertas generadas: {cards.get('alertas_generadas', {}).get('value', 0)} en seguimiento")
+    metrics_header = ["Pacientes activos", "Citas cumplidas", "Alertas generadas"]
+    metrics_row = [
+        f"{cards.get('pacientes_activos', {}).get('value', 0)}",
+        f"{cards.get('citas_cumplidas', {}).get('value', 0)}%",
+        f"{cards.get('alertas_generadas', {}).get('value', 0)}",
+    ]
+    metrics_data = [metrics_header, metrics_row]
 
-    # Indicadores de riesgo
-    y -= 1.0 * cm
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Indicadores de riesgo")
-    y -= 0.6 * cm
-    c.setFont("Helvetica", 11)
+    available_width = width - 2 * margin
+    col_width = available_width / 3.0
+    header_color = colors.HexColor("#003366")
+
+    metrics_table = Table(metrics_data, colWidths=[col_width] * 3)
+    metrics_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), header_color),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 11),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+    ]))
+
+    w, h = metrics_table.wrapOn(c, available_width, y)
+    metrics_table.drawOn(c, margin, y - h)
+    y = y - h - 12
+
     indicadores = data.get("indicadores", {})
-    c.drawString(margin, y, f"- Altas: {indicadores.get('altas', {}).get('percent', 0)}%")
-    y -= 0.5 * cm
-    c.drawString(margin, y, f"- Medias: {indicadores.get('medias', {}).get('percent', 0)}%")
-    y -= 0.5 * cm
-    c.drawString(margin, y, f"- Alertas: {indicadores.get('alertas', {}).get('percent', 0)}%")
+    risk_header = ["Altas", "Medias", "Alertas"]
+    risk_row = [
+        f"{indicadores.get('altas', {}).get('percent', 0)}%",
+        f"{indicadores.get('medias', {}).get('percent', 0)}%",
+        f"{indicadores.get('alertas', {}).get('percent', 0)}%",
+    ]
+    risk_data = [risk_header, risk_row]
+    risk_table = Table(risk_data, colWidths=[col_width] * 3)
+    risk_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), header_color),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 11),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+    ]))
+
+    w2, h2 = risk_table.wrapOn(c, available_width, y)
+    risk_table.drawOn(c, margin, y - h2)
+    y = y - h2 - 6
 
     # Pie de página
     c.setFont("Helvetica", 9)
@@ -166,34 +209,158 @@ def get_dashboard_excel():
         start_dt, end_dt = _month_range_utc()
     data = build_dashboard(start_iso=start_dt.isoformat() + "Z", end_iso=end_dt.isoformat() + "Z")
 
-    # Construir CSV (compatible con Excel)
-    buf = BytesIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Reporte de Indicadores del Sistema Prenatal"])
-    writer.writerow([f"Rango", start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d')])
-    writer.writerow([f"Generado", datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')])
-    writer.writerow([])
-    writer.writerow(["Métricas principales"])    
-    cards = data.get("cards", {})
-    writer.writerow(["Pacientes activos", cards.get('pacientes_activos', {}).get('value', 0), "gestantes"])    
-    writer.writerow(["Citas cumplidas (%)", cards.get('citas_cumplidas', {}).get('value', 0)])
-    writer.writerow(["Alertas generadas (en seguimiento)", cards.get('alertas_generadas', {}).get('value', 0)])
-    writer.writerow([])
-    writer.writerow(["Indicadores de riesgo"]) 
-    ind = data.get("indicadores", {})
-    writer.writerow(["Altas", ind.get('altas', {}).get('percent', 0)])
-    writer.writerow(["Medias", ind.get('medias', {}).get('percent', 0)])
-    writer.writerow(["Alertas", ind.get('alertas', {}).get('percent', 0)])
+    # Intentar exportar como XLSX estilado; si no hay openpyxl, usar CSV mejorado
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
 
-    # Preparar respuesta
-    buf.seek(0)
-    filename = f"reporte_dashboard_{datetime.utcnow().strftime('%Y%m%d')}.csv"
-    return send_file(
-        BytesIO(buf.getvalue()),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=filename,
-    )
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Reporte"
+
+        # Estilos
+        header_fill = PatternFill(fill_type="solid", fgColor="FF003366")
+        white_bold = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+        title_font = Font(name="Calibri", bold=True, size=14)
+        section_font = Font(name="Calibri", bold=True, size=12)
+        center = Alignment(horizontal="center", vertical="center")
+        left = Alignment(horizontal="left", vertical="center")
+        thin = Side(style="thin", color="000000")
+        border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        row = 1
+        # Título
+        title_cell = ws.cell(row=row, column=1, value="Reporte de Indicadores del Sistema Prenatal")
+        title_cell.font = title_font
+        title_cell.alignment = center
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        row += 1
+        # Rango y generado
+        ws.cell(row=row, column=1, value="Rango").font = section_font
+        ws.cell(row=row, column=2, value=start_dt.strftime('%Y-%m-%d'))
+        ws.cell(row=row, column=3, value=end_dt.strftime('%Y-%m-%d'))
+        row += 1
+        ws.cell(row=row, column=1, value="Generado").font = section_font
+        ws.cell(row=row, column=2, value=datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'))
+        row += 1
+
+        # Línea en blanco
+        row += 1
+
+        # Encabezado sección: Métricas principales
+        ws.cell(row=row, column=1, value="Métricas principales").font = section_font
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        row += 1
+
+        # Tabla de métricas
+        metrics_header = ["Pacientes activos", "Citas cumplidas (%)", "Alertas generadas (en seguimiento)"]
+        metrics_values = [
+            f"{data['cards'].get('pacientes_activos', {}).get('value', 0)} gestantes",
+            f"{data['cards'].get('citas_cumplidas', {}).get('value', 0)} %",
+            f"{data['cards'].get('alertas_generadas', {}).get('value', 0)} en seguimiento",
+        ]
+        for col, text in enumerate(metrics_header, start=1):
+            cell = ws.cell(row=row, column=col, value=text)
+            cell.fill = header_fill
+            cell.font = white_bold
+            cell.alignment = center
+            cell.border = border_all
+        row += 1
+        for col, text in enumerate(metrics_values, start=1):
+            cell = ws.cell(row=row, column=col, value=text)
+            cell.alignment = center
+            cell.border = border_all
+        row += 1
+
+        # Línea en blanco
+        row += 1
+
+        # Encabezado sección: Indicadores de riesgo
+        ws.cell(row=row, column=1, value="Indicadores de riesgo").font = section_font
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        row += 1
+
+        # Tabla de indicadores
+        risk_header = ["Altas", "Medias", "Alertas"]
+        ind = data.get("indicadores", {})
+        risk_values_pct = [
+            ind.get('altas', {}).get('percent', 0) / 100,
+            ind.get('medias', {}).get('percent', 0) / 100,
+            ind.get('alertas', {}).get('percent', 0) / 100,
+        ]
+        for col, text in enumerate(risk_header, start=1):
+            cell = ws.cell(row=row, column=col, value=text)
+            cell.fill = header_fill
+            cell.font = white_bold
+            cell.alignment = center
+            cell.border = border_all
+        row += 1
+        for col, val in enumerate(risk_values_pct, start=1):
+            cell = ws.cell(row=row, column=col, value=val)
+            cell.number_format = "0%"
+            cell.alignment = center
+            cell.border = border_all
+        row += 1
+
+        # Ajuste de anchos de columna simple basado en longitud del texto
+        for col in range(1, 4):
+            max_len = 0
+            for r in range(1, row):
+                v = ws.cell(row=r, column=col).value
+                if v is None:
+                    continue
+                s = v if isinstance(v, str) else str(v)
+                max_len = max(max_len, len(s))
+            ws.column_dimensions[get_column_letter(col)].width = min(max(12, max_len + 2), 50)
+
+        # Volcar a bytes
+        out = BytesIO()
+        wb.save(out)
+        out.seek(0)
+        filename = f"reporte_dashboard_{datetime.utcnow().strftime('%Y%m%d')}.xlsx"
+        return send_file(
+            out,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except Exception:
+        # Fallback CSV estructurado si no hay openpyxl
+        buf_text = StringIO()
+        writer = csv.writer(buf_text)
+        writer.writerow(["Reporte de Indicadores del Sistema Prenatal"])
+        writer.writerow(["Rango", start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d')])
+        writer.writerow(["Generado", datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')])
+        writer.writerow([])
+        # Métricas principales en tabla
+        writer.writerow(["Métricas principales"])    
+        writer.writerow(["Pacientes activos", "Citas cumplidas (%)", "Alertas generadas (en seguimiento)"])
+        cards = data.get("cards", {})
+        writer.writerow([
+            f"{cards.get('pacientes_activos', {}).get('value', 0)} gestantes",
+            f"{cards.get('citas_cumplidas', {}).get('value', 0)} %",
+            f"{cards.get('alertas_generadas', {}).get('value', 0)} en seguimiento",
+        ])
+        writer.writerow([])
+        # Indicadores de riesgo en tabla
+        writer.writerow(["Indicadores de riesgo"]) 
+        writer.writerow(["Altas", "Medias", "Alertas"]) 
+        ind = data.get("indicadores", {})
+        writer.writerow([
+            f"{ind.get('altas', {}).get('percent', 0)} %",
+            f"{ind.get('medias', {}).get('percent', 0)} %",
+            f"{ind.get('alertas', {}).get('percent', 0)} %",
+        ])
+
+        payload = buf_text.getvalue().encode("utf-8-sig")
+        filename = f"reporte_dashboard_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+        return send_file(
+            BytesIO(payload),
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name=filename,
+        )
 
 
 def get_dashboard_json_download():

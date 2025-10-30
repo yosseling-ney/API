@@ -249,11 +249,15 @@ def generar_resumen_panel(start_iso: Optional[str] = None, end_iso: Optional[str
         activos_ids = []
 
     niveles = _clasificar_por_paciente_ids(activos_ids, start_dt=start_dt, end_dt=end_dt)
-    total_eval = max(1, len(activos_ids))
-    altas_pct = round(100 * niveles.get("alto", 0) / total_eval)
-    medias_pct = round(100 * niveles.get("medio", 0) / total_eval)
-    # el resto como "alertas" (bajo/ninguno)
-    alertas_pct = max(0, 100 - altas_pct - medias_pct)
+    total_eval = len(activos_ids)
+    if total_eval == 0:
+        # Evitar mostrar 100% alertas cuando no hay pacientes evaluados
+        altas_pct = medias_pct = alertas_pct = 0
+    else:
+        altas_pct = round(100 * niveles.get("alto", 0) / total_eval)
+        medias_pct = round(100 * niveles.get("medio", 0) / total_eval)
+        # el resto como "alertas" (bajo/ninguno)
+        alertas_pct = max(0, 100 - altas_pct - medias_pct)
 
     # 4) Conteo de "alertas en seguimiento": alto o medio
     alertas_en_seguimiento = int(niveles.get("alto", 0) + niveles.get("medio", 0))
